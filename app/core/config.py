@@ -11,8 +11,8 @@ class Settings(BaseSettings):
     api_v1_str: str = "/api/v1"
     database_url: str = "postgresql+psycopg2://fraude_user:fraude_pass@localhost:5432/fraude_back"
     sqlalchemy_echo: bool = False
-    gmail_client_secret_file: str = "/app/credentials.json"
-    gmail_token_file: str = "/app/token.json"
+    gmail_client_secret_file: str = "credentials.json"
+    gmail_token_file: str = "token.json"
     gmail_download_dir: str = "storage/gmail_attachments"
     gmail_watch_topic: str = ""
     gmail_keywords: str = "SINIESTRO,RECLAMO"
