@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 import logging
 
@@ -10,10 +10,27 @@ router = APIRouter(prefix="/gmail", tags=["Gmail"])
 logger = logging.getLogger(__name__)
 
 
+@router.get("/config")
+def gmail_config() -> dict[str, str]:
+    """Muestra la config Gmail que usa este proceso (útil si hay varios uvicorn abiertos)."""
+    from app.core.config import get_settings
+
+    settings = get_settings()
+    return {
+        "gmail_watch_topic": settings.gmail_watch_topic,
+        "gmail_client_secret_file": settings.gmail_client_secret_file,
+        "gmail_token_file": settings.gmail_token_file,
+    }
+
+
 @router.post("/watch/register")
 def register_watch(db: Session = Depends(get_db)) -> dict[str, object]:
-    service = GmailIngestionService(db)
-    result = service.register_watch()
+    try:
+        service = GmailIngestionService(db)
+        result = service.register_watch()
+    except ValueError as exc:
+        logger.warning("register_watch rechazado: %s", exc)
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     logger.info("Watch Gmail registrado result=%s", result)
     return {"status": "watch_registered", "result": result}
 

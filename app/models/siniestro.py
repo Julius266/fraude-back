@@ -1,5 +1,6 @@
 from sqlalchemy import Boolean, Column, Date, ForeignKey, Index, Integer, Numeric, String, Text
 from sqlalchemy.orm import relationship
+from pgvector.sqlalchemy import Vector
 
 from app.db.base import Base
 
@@ -28,6 +29,7 @@ class Siniestro(Base):
     dias_entre_ocurrencia_reporte = Column(Integer, nullable=False)
     historial_siniestros_asegurado = Column(Integer, nullable=False, default=0)
     etiqueta_fraude_simulada = Column(Boolean, nullable=False, default=False)
+    embedding = Column(Vector(1536), nullable=True)
     correo = relationship("GmailCorreo", back_populates="siniestros")
 
     __table_args__ = (
