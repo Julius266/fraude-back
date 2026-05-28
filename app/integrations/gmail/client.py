@@ -1,0 +1,193 @@
+from __future__ import annotations
+
+import base64
+import json
+import logging
+import re
+import unicodedata
+from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
+from pathlib import Path
+from typing import Any
+
+from google.auth.transport.requests import Request
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import InstalledAppFlow
+from googleapiclient.errors import HttpError
+from googleapiclient.discovery import build
+
+from app.core.config import get_settings
+
+logger = logging.getLogger(__name__)
+
+
+class GmailClient:
+    SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
+
+    def __init__(self) -> None:
+        self.settings = get_settings()
+        self.service = self._authenticate()
+
+    def _authenticate(self):
+        creds = None
+        token_path = Path(self.settings.gmail_token_file)
+
+        if token_path.exists():
+            with token_path.open("r", encoding="utf-8") as token_file:
+                creds = Credentials.from_authorized_user_info(json.load(token_file), self.SCOPES)
+
+        if not creds or not creds.valid:
+            if creds and creds.expired and creds.refresh_token:
+                creds.refresh(Request())
+            else:
+                flow = InstalledAppFlow.from_client_secrets_file(
+                    self.settings.gmail_client_secret_file,
+                    self.SCOPES,
+                )
+                creds = flow.run_local_server(port=0)
+
+            self._save_token(creds, token_path)
+
+        return build("gmail", "v1", credentials=creds)
+
+    def _save_token(self, creds: Credentials, token_path: Path) -> None:
+        token_path.parent.mkdir(parents=True, exist_ok=True)
+        with token_path.open("w", encoding="utf-8") as token_file:
+            json.dump(
+                {
+                    "token": creds.token,
+                    "refresh_token": creds.refresh_token,
+                    "token_uri": creds.token_uri,
+                    "client_id": creds.client_id,
+                    "client_secret": creds.client_secret,
+                    "scopes": creds.scopes,
+                },
+                token_file,
+            )
+
+    def watch(self, topic_name: str) -> dict[str, Any]:
+        request_body = {"topicName": topic_name, "labelIds": ["INBOX"]}
+        return self.service.users().watch(userId="me", body=request_body).execute()
+
+    def list_recent_messages(self, query: str, max_results: int) -> list[dict[str, str]]:
+        response = (
+            self.service.users()
+            .messages()
+            .list(userId="me", q=query, maxResults=max_results)
+            .execute()
+        )
+        return response.get("messages", [])
+
+    def get_history_changes(self, start_history_id: str) -> dict[str, Any]:
+        response = self.service.users().history().list(
+            userId="me",
+            startHistoryId=start_history_id,
+            historyTypes=["messageAdded"],
+        ).execute()
+        return response
+
+    @staticmethod
+    def is_history_not_found(error: Exception) -> bool:
+        return isinstance(error, HttpError) and getattr(error, "status_code", None) == 404
+
+    def get_message(self, message_id: str, format_: str = "full") -> dict[str, Any]:
+        return (
+            self.service.users()
+            .messages()
+            .get(userId="me", id=message_id, format=format_)
+            .execute()
+        )
+
+    def get_attachment(self, message_id: str, attachment_id: str) -> bytes:
+        response = (
+            self.service.users()
+            .messages()
+            .attachments()
+            .get(userId="me", messageId=message_id, id=attachment_id)
+            .execute()
+        )
+        data = response.get("data", "")
+        return base64.urlsafe_b64decode(self._pad_base64(data))
+
+    def _pad_base64(self, value: str) -> str:
+        return value + "=" * (-len(value) % 4)
+
+    def extract_headers(self, payload: dict[str, Any]) -> dict[str, str]:
+        headers = payload.get("headers", [])
+        return {header.get("name", "").lower(): header.get("value", "") for header in headers}
+
+    def extract_body_text(self, payload: dict[str, Any]) -> str:
+        parts = payload.get("parts", [])
+        mime_type = payload.get("mimeType", "")
+
+        if mime_type == "text/plain":
+            body_data = payload.get("body", {}).get("data")
+            if body_data:
+                return self._decode_body(body_data)
+
+        if mime_type == "text/html":
+            body_data = payload.get("body", {}).get("data")
+            if body_data:
+                return self._decode_body(body_data)
+
+        collected: list[str] = []
+        for part in parts:
+            collected_text = self.extract_body_text(part)
+            if collected_text:
+                collected.append(collected_text)
+
+        if collected:
+            return "\n".join(collected)
+
+        body_data = payload.get("body", {}).get("data")
+        if body_data:
+            return self._decode_body(body_data)
+
+        return ""
+
+    def extract_attachments(self, message_id: str, payload: dict[str, Any]) -> list[dict[str, str]]:
+        attachments: list[dict[str, str]] = []
+        for part in payload.get("parts", []):
+            attachments.extend(self.extract_attachments(message_id, part))
+
+        filename = payload.get("filename")
+        body = payload.get("body", {})
+        attachment_id = body.get("attachmentId")
+
+        if filename and attachment_id:
+            attachments.append(
+                {
+                    "filename": filename,
+                    "attachment_id": attachment_id,
+                    "mime_type": payload.get("mimeType", "application/octet-stream"),
+                }
+            )
+
+        return attachments
+
+    def _decode_body(self, encoded: str) -> str:
+        raw = base64.urlsafe_b64decode(self._pad_base64(encoded))
+        return raw.decode("utf-8", errors="ignore")
+
+    def normalize_text(self, value: str) -> str:
+        normalized = unicodedata.normalize("NFKD", value or "")
+        stripped = "".join(character for character in normalized if not unicodedata.combining(character))
+        return re.sub(r"\s+", " ", stripped).upper().strip()
+
+    def parse_email_date(self, headers: dict[str, str]) -> datetime | None:
+        raw_date = headers.get("date")
+        if not raw_date:
+            return None
+
+        try:
+            parsed = parsedate_to_datetime(raw_date)
+            if parsed.tzinfo is None:
+                return parsed.replace(tzinfo=timezone.utc)
+            return parsed.astimezone(timezone.utc)
+        except Exception:
+            logger.exception("No se pudo parsear la fecha del correo")
+            return None
+
+    def build_query(self, hours_back: int) -> str:
+        since = datetime.now(timezone.utc) - timedelta(hours=hours_back)
+        return f"after:{int(since.timestamp())} in:inbox"
