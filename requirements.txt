@@ -11,4 +11,5 @@ google-auth-oauthlib>=1.2,<2.0
 pypdf>=6.0,<7.0
 pymupdf>=1.27,<2.0
 rapidocr-onnxruntime>=1.2,<2.0
+openai>=1.40,<2.0
 
