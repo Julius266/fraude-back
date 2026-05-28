@@ -19,6 +19,8 @@ class Settings(BaseSettings):
     gmail_query_hours_back: int = 48
     gmail_max_results: int = 50
     enable_pdf_ocr: bool = True
+    openai_api_key: str = ""
+    openai_model: str = "gpt-4.1"
 
     @property
     def gmail_keywords_list(self) -> list[str]:
