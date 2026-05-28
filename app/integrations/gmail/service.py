@@ -8,6 +8,8 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
+from app.core.exceptions import validate_gmail_watch_topic
+from app.integrations.chat.index_service import EmbeddingIndexService
 from app.integrations.gmail.client import GmailClient
 from app.integrations.siniestros.pdf_parser import SiniestroPdfParser, ParsedSiniestroDraft
 from app.models.siniestro import Siniestro
@@ -31,6 +33,10 @@ class GmailIngestionService:
     def register_watch(self) -> dict:
         if not self.settings.gmail_watch_topic:
             raise ValueError("GMAIL_WATCH_TOPIC no esta configurado")
+        validate_gmail_watch_topic(
+            self.settings.gmail_watch_topic,
+            self.settings.gmail_client_secret_file,
+        )
         logger.info("Registrando watch de Gmail topic=%s", self.settings.gmail_watch_topic)
         result = self.client.watch(self.settings.gmail_watch_topic)
         history_id = result.get("historyId")
@@ -286,6 +292,7 @@ class GmailIngestionService:
         saved_attachments: list[tuple[dict[str, str], tuple[str, str]]],
     ) -> int:
         siniestros_creados = 0
+        created_entities: list[Siniestro] = []
 
         for attachment, saved_attachment in saved_attachments:
             if not self._is_pdf_attachment(attachment):
@@ -319,10 +326,23 @@ class GmailIngestionService:
             for parsed in parsed_siniestros:
                 entity = self._build_siniestro_entity(correo.id, parsed)
                 self.db.add(entity)
+                created_entities.append(entity)
                 siniestros_creados += 1
 
         if siniestros_creados:
             self.db.commit()
+            index_service = EmbeddingIndexService(self.db)
+            indexed = 0
+            for entity in created_entities:
+                if index_service.index_one(entity, commit=False):
+                    indexed += 1
+            self.db.commit()
+            logger.info(
+                "Embeddings generados para siniestros correo_id=%s indexed=%s total=%s",
+                correo.id,
+                indexed,
+                siniestros_creados,
+            )
 
         return siniestros_creados
 
