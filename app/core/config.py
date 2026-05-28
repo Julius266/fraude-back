@@ -8,10 +8,12 @@ class Settings(BaseSettings):
     app_env: str = "development"
     api_v1_str: str = "/api/v1"
     app_base_url: str = "http://127.0.0.1:8000"
+    frontend_url: str = "http://localhost:3000"
     database_url: str = "postgresql+psycopg2://fraude_user:fraude_pass@localhost:5432/fraude_back"
     sqlalchemy_echo: bool = False
     gmail_client_secret_file: str = "credentials.json"
     gmail_token_file: str = "token.json"
+    gmail_oauth_redirect_uri: str = "http://127.0.0.1:8000/api/v1/gmail/auth/callback"
     gmail_download_dir: str = "storage/gmail_attachments"
     gmail_watch_topic: str = ""
     gmail_keywords: str = "SINIESTRO,RECLAMO"
@@ -25,6 +27,12 @@ class Settings(BaseSettings):
     chat_k_results: int = 8
     chat_max_history: int = 10
     chat_session_ttl_seconds: int = 1800
+    fraud_rules_examples_file: str = "reglas_fraude_ejemplos.md"
+    allowed_origins: str = "http://localhost:3000"
+
+    @property
+    def allowed_origins_list(self) -> list[str]:
+        return [origin.strip() for origin in self.allowed_origins.split(",") if origin.strip()]
 
     @property
     def gmail_keywords_list(self) -> list[str]:

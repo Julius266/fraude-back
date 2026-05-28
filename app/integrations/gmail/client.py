@@ -1,69 +1,37 @@
 from __future__ import annotations
 
 import base64
-import json
 import logging
 import re
 import unicodedata
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
-from pathlib import Path
 from typing import Any
 
-from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
-from googleapiclient.errors import HttpError
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 
-from app.core.config import get_settings
+from app.integrations.gmail.oauth import GmailNotAuthenticatedError, load_valid_credentials
 
 logger = logging.getLogger(__name__)
 
 
 class GmailClient:
-    SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
-
-    def __init__(self) -> None:
-        self.settings = get_settings()
-        self.service = self._authenticate()
-
-    def _authenticate(self):
-        creds = None
-        token_path = Path(self.settings.gmail_token_file)
-
-        if token_path.exists():
-            with token_path.open("r", encoding="utf-8") as token_file:
-                creds = Credentials.from_authorized_user_info(json.load(token_file), self.SCOPES)
-
-        if not creds or not creds.valid:
-            if creds and creds.expired and creds.refresh_token:
-                creds.refresh(Request())
-            else:
-                flow = InstalledAppFlow.from_client_secrets_file(
-                    self.settings.gmail_client_secret_file,
-                    self.SCOPES,
-                )
-                creds = flow.run_local_server(port=0)
-
-            self._save_token(creds, token_path)
-
-        return build("gmail", "v1", credentials=creds)
-
-    def _save_token(self, creds: Credentials, token_path: Path) -> None:
-        token_path.parent.mkdir(parents=True, exist_ok=True)
-        with token_path.open("w", encoding="utf-8") as token_file:
-            json.dump(
-                {
-                    "token": creds.token,
-                    "refresh_token": creds.refresh_token,
-                    "token_uri": creds.token_uri,
-                    "client_id": creds.client_id,
-                    "client_secret": creds.client_secret,
-                    "scopes": creds.scopes,
-                },
-                token_file,
+    def __init__(self, credentials: Credentials | None = None) -> None:
+        creds = credentials or load_valid_credentials()
+        if creds is None:
+            raise GmailNotAuthenticatedError(
+                "No hay sesión OAuth de Gmail. Conecta tu cuenta desde el login."
             )
+        self.service = build("gmail", "v1", credentials=creds, cache_discovery=False)
+
+    def get_profile(self) -> dict[str, str]:
+        profile = self.service.users().getProfile(userId="me").execute()
+        return {
+            "emailAddress": profile.get("emailAddress", "") or "",
+            "historyId": str(profile.get("historyId", "") or ""),
+        }
 
     def watch(self, topic_name: str) -> dict[str, Any]:
         request_body = {"topicName": topic_name, "labelIds": ["INBOX"]}

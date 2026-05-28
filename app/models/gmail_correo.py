@@ -20,6 +20,7 @@ class GmailCorreo(Base):
     tiene_adjunto: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     fecha_correo: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     palabra_clave_detectada: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    owner_email: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
     fecha_registro: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
     siniestros = relationship("Siniestro", back_populates="correo")
 

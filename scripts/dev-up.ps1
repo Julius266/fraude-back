@@ -11,17 +11,12 @@ if (-not (Test-Path ".\.venv\Scripts\python.exe")) {
 }
 
 # Mata cualquier proceso escuchando en los puertos de desarrollo comunes.
-$portsToClear = @($Port, 8001, 8002)
-foreach ($p in $portsToClear) {
-    $listeners = Get-NetTCPConnection -LocalPort $p -State Listen -ErrorAction SilentlyContinue
-    foreach ($listener in $listeners) {
-        try {
-            Stop-Process -Id $listener.OwningProcess -Force -ErrorAction SilentlyContinue
-            Write-Host "Puerto $p liberado (PID $($listener.OwningProcess))."
-        } catch {
-            # Ignorar si el proceso ya no existe.
-        }
-    }
+& "$PSScriptRoot\dev-down.ps1" | Out-Null
+
+Write-Host "Aplicando migraciones de base de datos..."
+& ".\.venv\Scripts\python.exe" -m alembic upgrade head
+if ($LASTEXITCODE -ne 0) {
+    throw "Fallo alembic upgrade head"
 }
 
 Write-Host ""

@@ -1,6 +1,7 @@
 import logging
 
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse
 from googleapiclient.errors import HttpError
 
@@ -27,6 +28,14 @@ app = FastAPI(
     },
 )
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.allowed_origins_list,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 app.add_exception_handler(HttpError, http_error_handler)
 app.add_exception_handler(Exception, unhandled_exception_handler)
 
@@ -34,7 +43,7 @@ app.include_router(api_router, prefix=settings.api_v1_str)
 
 
 @app.on_event("startup")
-def log_useful_links() -> None:
+def on_startup() -> None:
     base_url = settings.app_base_url.rstrip("/")
     logger.info("API lista: %s", base_url)
     logger.info("Swagger: %s/swagger", base_url)

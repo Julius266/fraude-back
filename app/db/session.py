@@ -10,8 +10,15 @@ settings = get_settings()
 engine_kwargs = {"echo": settings.sqlalchemy_echo, "future": True}
 if settings.database_url.startswith("sqlite"):
     engine_kwargs["connect_args"] = {"check_same_thread": False}
-
-engine = create_engine(settings.database_url, **engine_kwargs)
+    engine = create_engine(settings.database_url, **engine_kwargs)
+else:
+    engine = create_engine(
+        settings.database_url,
+        pool_pre_ping=True,
+        pool_size=10,
+        max_overflow=20,
+        **engine_kwargs,
+    )
 
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
 
