@@ -1,7 +1,14 @@
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal
 
 from pydantic import BaseModel, ConfigDict, Field
+
+from app.schemas.scoring import (
+    ScoringAiExplanation,
+    ScoringBreakdownItem,
+    ScoringRuleResult,
+    ScoringSignals,
+)
 
 
 class SiniestroBase(BaseModel):
@@ -34,4 +41,36 @@ class SiniestroCreate(SiniestroBase):
 class SiniestroRead(SiniestroBase):
     model_config = ConfigDict(from_attributes=True)
 
+    owner_email: str | None = None
     gmail_correo_id: int | None = None
+
+
+class SiniestroWithScoreRead(SiniestroRead):
+    total_score: int = 0
+    average_points: float = 0.0
+    score_color: str = "Verde"
+    score_band: str = "Bajo"
+    rules: list[ScoringRuleResult] | None = None
+    breakdown: list[ScoringBreakdownItem] | None = None
+    matched_rules: list[str] | None = None
+    scoring_version: str | None = None
+    ai: ScoringAiExplanation | None = None
+    signals: ScoringSignals | None = None
+    scoring_audited_at: datetime | None = None
+
+
+class SiniestrosSummary(BaseModel):
+    total: int
+    by_color: dict[str, int]
+    by_ramo: dict[str, int]
+    pending_indexing: int
+
+
+class SendEmailResponse(BaseModel):
+    success: bool
+    message: str
+    htmlTemplate: str
+
+
+class SendEmailRequest(BaseModel):
+    id_siniestro: str = Field(..., min_length=1, max_length=50)

@@ -4,14 +4,18 @@ import logging
 from pathlib import Path
 
 from googleapiclient.errors import HttpError
-from sqlalchemy import select
+from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
 from app.core.exceptions import validate_gmail_watch_topic
 from app.integrations.chat.index_service import EmbeddingIndexService
 from app.integrations.gmail.client import GmailClient
-from app.integrations.siniestros.pdf_parser import SiniestroPdfParser, ParsedSiniestroDraft
+from app.integrations.gmail.oauth import GmailNotAuthenticatedError, display_name_from_email
+from app.api.owner_scope import siniestro_scope
+from app.integrations.siniestros.auto_scoring import AutoScoringService
+from app.integrations.siniestros.pdf_parser import ParsedSiniestroDraft, SiniestroPdfParser
 from app.models.siniestro import Siniestro
 from app.models.gmail_correo import GmailCorreo
 from app.models.gmail_sync_state import GmailSyncState
@@ -22,13 +26,45 @@ logger = logging.getLogger(__name__)
 class GmailIngestionService:
     SYNC_SCOPE_KEY = "default"
 
-    def __init__(self, db: Session):
+    def __init__(self, db: Session, owner_email: str | None = None):
         self.db = db
         self.settings = get_settings()
-        self.client = GmailClient()
+        self.owner_email = (owner_email or "").strip().lower() or None
+        self._client: GmailClient | None = None
         self.pdf_parser = SiniestroPdfParser(enable_ocr=self.settings.enable_pdf_ocr)
         self.download_dir = Path(self.settings.gmail_download_dir)
         self.download_dir.mkdir(parents=True, exist_ok=True)
+
+    @property
+    def client(self) -> GmailClient:
+        if self._client is None:
+            self._client = GmailClient()
+        return self._client
+
+    @staticmethod
+    def _display_name_from_email(email: str) -> str:
+        return display_name_from_email(email)
+
+    def get_connected_user(self) -> dict[str, str]:
+        profile = self.client.get_profile()
+        email = profile.get("emailAddress", "").strip()
+        if not self.owner_email and email:
+            self.owner_email = email.strip().lower()
+        return {
+            "email": email,
+            "name": self._display_name_from_email(email),
+            "role": "Analista de Fraude",
+        }
+
+    def _resolve_owner_email(self) -> str:
+        if self.owner_email:
+            return self.owner_email
+        user = self.get_connected_user()
+        email = user["email"].strip().lower()
+        if not email:
+            raise GmailNotAuthenticatedError("No se pudo determinar el analista conectado.")
+        self.owner_email = email
+        return email
 
     def register_watch(self) -> dict:
         if not self.settings.gmail_watch_topic:
@@ -47,7 +83,7 @@ class GmailIngestionService:
             logger.warning("Watch de Gmail respondio sin historyId result=%s", result)
         return result
 
-    def process_recent_messages(self) -> dict[str, int]:
+    def process_recent_messages(self) -> dict[str, object]:
         query = self.client.build_query(self.settings.gmail_query_hours_back)
         logger.info("Iniciando scan manual de Gmail query=%s max_results=%s", query, self.settings.gmail_max_results)
         message_refs = self.client.list_recent_messages(query, self.settings.gmail_max_results)
@@ -55,17 +91,37 @@ class GmailIngestionService:
 
         saved = 0
         ignored = 0
+        audits: list[dict[str, object]] = []
+        seen_ids: set[str] = set()
 
         for ref in message_refs:
-            created = self._process_message(ref["id"])
+            message_id = ref["id"]
+            if message_id in seen_ids:
+                ignored += 1
+                continue
+            seen_ids.add(message_id)
+
+            created, message_audits = self._process_message(message_id)
+            audits.extend(message_audits)
             if created:
                 saved += 1
             else:
                 ignored += 1
 
-        logger.info("Scan manual finalizado saved=%s ignored=%s", saved, ignored)
+        pending_audits = self._audit_pending_siniestros()
+        audits.extend(pending_audits)
 
-        return {"saved": saved, "ignored": ignored}
+        reprocess_audits = self._reprocess_unlinked_correos()
+        audits.extend(reprocess_audits)
+
+        logger.info(
+            "Scan manual finalizado saved=%s ignored=%s audits=%s",
+            saved,
+            ignored,
+            len(audits),
+        )
+
+        return {"saved": saved, "ignored": ignored, "audits": audits}
 
     def process_push_notification(self, notification_payload: dict[str, object]) -> dict[str, object]:
         notification_history_id = str(notification_payload.get("historyId", "")).strip()
@@ -138,7 +194,7 @@ class GmailIngestionService:
 
         for message_id in message_ids:
             logger.info("Procesando mensaje Gmail message_id=%s", message_id)
-            created = self._process_message(message_id)
+            created, _message_audits = self._process_message(message_id)
             if created:
                 saved += 1
             else:
@@ -162,17 +218,20 @@ class GmailIngestionService:
         }
 
     def process_message_by_id(self, message_id: str) -> bool:
-        return self._process_message(message_id)
+        created, _audits = self._process_message(message_id)
+        return created
 
-    def list_saved_messages(self, limit: int = 100) -> list[GmailCorreo]:
+    def list_saved_messages(self, limit: int = 100, owner_email: str | None = None) -> list[GmailCorreo]:
+        owner = (owner_email or self.owner_email or "").strip().lower()
         statement = select(GmailCorreo).order_by(GmailCorreo.fecha_registro.desc()).limit(limit)
+        if owner:
+            statement = statement.where(GmailCorreo.owner_email == owner)
         return list(self.db.scalars(statement).all())
 
-    def _process_message(self, message_id: str) -> bool:
-        existing = self.db.scalar(select(GmailCorreo).where(GmailCorreo.gmail_message_id == message_id))
-        if existing:
+    def _process_message(self, message_id: str) -> tuple[bool, list[dict[str, object]]]:
+        if self._message_already_saved(message_id):
             logger.info("Mensaje Gmail ya estaba guardado message_id=%s", message_id)
-            return False
+            return False, []
 
         try:
             message = self.client.get_message(message_id, format_="full")
@@ -182,7 +241,7 @@ class GmailIngestionService:
                     "Mensaje Gmail no encontrado al procesarlo message_id=%s; se omite para no romper el webhook",
                     message_id,
                 )
-                return False
+                return False, []
             raise
 
         payload = message.get("payload", {})
@@ -201,7 +260,7 @@ class GmailIngestionService:
                 message_id,
                 subject,
             )
-            return False
+            return False, []
 
         attachments = self.client.extract_attachments(message_id, payload)
         logger.info(
@@ -245,17 +304,46 @@ class GmailIngestionService:
             tiene_adjunto=has_attachment,
             fecha_correo=self.client.parse_email_date(headers),
             palabra_clave_detectada=keyword,
+            owner_email=self._resolve_owner_email(),
         )
 
         self.db.add(correo)
-        self.db.commit()
-        self.db.refresh(correo)
+        try:
+            self.db.commit()
+            self.db.refresh(correo)
+        except IntegrityError:
+            self.db.rollback()
+            logger.info("Mensaje Gmail duplicado al guardar message_id=%s", message_id)
+            return False, []
+
         logger.info("Correo Gmail guardado message_id=%s keyword=%s", message_id, keyword)
 
-        siniestros_creados = self._process_pdf_attachments(correo, saved_attachments)
-        if siniestros_creados:
-            logger.info("Siniestros creados desde correo correo_id=%s count=%s", correo.id, siniestros_creados)
-        return True
+        siniestros_to_audit = self._process_pdf_attachments(correo, saved_attachments)
+        audits = self._auto_audit_siniestros(siniestros_to_audit)
+        if siniestros_to_audit:
+            logger.info(
+                "Siniestros auditados desde correo correo_id=%s count=%s audits=%s",
+                correo.id,
+                len(siniestros_to_audit),
+                len(audits),
+            )
+        return True, audits
+
+    def _message_already_saved(self, message_id: str) -> bool:
+        for obj in self.db.new:
+            if isinstance(obj, GmailCorreo) and obj.gmail_message_id == message_id:
+                return True
+
+        existing = self.db.scalar(
+            select(GmailCorreo).where(GmailCorreo.gmail_message_id == message_id)
+        )
+        if existing is not None:
+            if not existing.owner_email:
+                existing.owner_email = self._resolve_owner_email()
+                self.db.commit()
+            return True
+
+        return False
 
     def _match_keyword(self, subject: str, content: str) -> str | None:
         subject_normalized = self.client.normalize_text(subject)
@@ -286,13 +374,79 @@ class GmailIngestionService:
 
         return filename, str(file_path)
 
+    @staticmethod
+    def _analyst_scoped_id(base_id: str, owner_email: str) -> str:
+        clean = base_id.split("|")[0].strip()
+        slug = owner_email.split("@")[0].replace(".", "")[:12]
+        return f"{clean}|{slug}"[:50]
+
+    @staticmethod
+    def _correo_variant_id(base_id: str, owner_email: str, correo_id: int) -> str:
+        clean = base_id.split("|")[0].strip()
+        slug = owner_email.split("@")[0].replace(".", "")[:8]
+        return f"{clean}|{slug}|c{correo_id}"[:50]
+
+    def _siniestro_already_linked_to_correo(self, correo_id: int, base_id: str) -> Siniestro | None:
+        clean = base_id.split("|")[0].strip()
+        rows = list(
+            self.db.scalars(select(Siniestro).where(Siniestro.gmail_correo_id == correo_id)).all()
+        )
+        for row in rows:
+            if row.id_siniestro.split("|")[0].strip() == clean:
+                return row
+        return None
+
+    def reprocess_correo_pdfs(self, correo: GmailCorreo) -> list[dict[str, object]]:
+        if not correo.tiene_adjunto or not correo.adjunto_ruta:
+            return []
+
+        pdf_path = Path(correo.adjunto_ruta)
+        if not pdf_path.exists():
+            logger.warning("PDF no encontrado en disco correo_id=%s path=%s", correo.id, pdf_path)
+            return []
+
+        filename = correo.adjunto_nombre or pdf_path.name
+        if not self._is_pdf_attachment({"filename": filename, "mime_type": "application/pdf"}):
+            return []
+
+        attachment = {"filename": filename, "mime_type": "application/pdf"}
+        saved_attachment = (filename, str(pdf_path))
+        to_audit = self._process_pdf_attachments(correo, [(attachment, saved_attachment)])
+        return self._auto_audit_siniestros(to_audit)
+
+    def _reprocess_unlinked_correos(self) -> list[dict[str, object]]:
+        owner = self._resolve_owner_email()
+        correos = list(
+            self.db.scalars(
+                select(GmailCorreo).where(
+                    GmailCorreo.owner_email == owner,
+                    GmailCorreo.tiene_adjunto.is_(True),
+                    GmailCorreo.adjunto_ruta.isnot(None),
+                )
+            ).all()
+        )
+
+        audits: list[dict[str, object]] = []
+        for correo in correos:
+            linked_count = self.db.scalar(
+                select(func.count())
+                .select_from(Siniestro)
+                .where(Siniestro.gmail_correo_id == correo.id)
+            )
+            if linked_count and linked_count > 0:
+                continue
+            logger.info("Reprocesando PDF pendiente correo_id=%s asunto=%s", correo.id, correo.asunto)
+            audits.extend(self.reprocess_correo_pdfs(correo))
+        return audits
+
     def _process_pdf_attachments(
         self,
         correo: GmailCorreo,
         saved_attachments: list[tuple[dict[str, str], tuple[str, str]]],
-    ) -> int:
+    ) -> list[Siniestro]:
         siniestros_creados = 0
         created_entities: list[Siniestro] = []
+        entities_to_audit: list[Siniestro] = []
 
         for attachment, saved_attachment in saved_attachments:
             if not self._is_pdf_attachment(attachment):
@@ -324,19 +478,106 @@ class GmailIngestionService:
             )
 
             for parsed in parsed_siniestros:
-                entity = self._build_siniestro_entity(correo.id, parsed)
+                owner = self._resolve_owner_email()
+                base_id = parsed.id_siniestro.split("|")[0].strip()
+
+                linked = self._siniestro_already_linked_to_correo(correo.id, base_id)
+                if linked is not None:
+                    if linked.scoring_payload is None:
+                        entities_to_audit.append(linked)
+                    continue
+
+                variant_id = self._correo_variant_id(base_id, owner, correo.id)
+                existing_variant = self.db.scalar(
+                    select(Siniestro).where(Siniestro.id_siniestro == variant_id)
+                )
+                if existing_variant is not None:
+                    if existing_variant.gmail_correo_id is None:
+                        existing_variant.gmail_correo_id = correo.id
+                        self.db.commit()
+                    if existing_variant.scoring_payload is None:
+                        entities_to_audit.append(existing_variant)
+                    continue
+
+                existing = self.db.scalar(
+                    select(Siniestro).where(Siniestro.id_siniestro == parsed.id_siniestro)
+                )
+                if existing is not None:
+                    if not existing.owner_email:
+                        existing.owner_email = owner
+                        if existing.gmail_correo_id is None:
+                            existing.gmail_correo_id = correo.id
+                        self.db.commit()
+                        self.db.refresh(existing)
+                        logger.info(
+                            "Siniestro legacy reclamado por analista id=%s owner=%s",
+                            parsed.id_siniestro,
+                            owner,
+                        )
+                        if existing.scoring_payload is None:
+                            entities_to_audit.append(existing)
+                        continue
+
+                    if existing.owner_email == owner and existing.gmail_correo_id == correo.id:
+                        if existing.scoring_payload is None:
+                            entities_to_audit.append(existing)
+                        continue
+
+                    scoped_id = self._analyst_scoped_id(base_id, owner)
+                    existing_clone = self.db.scalar(
+                        select(Siniestro).where(Siniestro.id_siniestro == scoped_id)
+                    )
+                    if existing_clone is not None and existing_clone.gmail_correo_id == correo.id:
+                        if existing_clone.scoring_payload is None:
+                            entities_to_audit.append(existing_clone)
+                        continue
+
+                    target_id = variant_id
+                    if existing_clone is None and existing.owner_email != owner:
+                        target_id = scoped_id
+
+                    logger.info(
+                        "Creando siniestro desde correo base=%s target=%s owner=%s correo_id=%s",
+                        base_id,
+                        target_id,
+                        owner,
+                        correo.id,
+                    )
+                    entity = self._build_siniestro_entity(
+                        correo.id,
+                        parsed,
+                        id_siniestro=target_id,
+                    )
+                    self.db.add(entity)
+                    created_entities.append(entity)
+                    siniestros_creados += 1
+                    continue
+
+                entity = self._build_siniestro_entity(
+                    correo.id,
+                    parsed,
+                    id_siniestro=variant_id,
+                )
                 self.db.add(entity)
                 created_entities.append(entity)
                 siniestros_creados += 1
 
         if siniestros_creados:
-            self.db.commit()
+            try:
+                self.db.commit()
+            except IntegrityError:
+                self.db.rollback()
+                logger.info("Siniestro duplicado al guardar desde PDF correo_id=%s", correo.id)
+                return entities_to_audit
             index_service = EmbeddingIndexService(self.db)
             indexed = 0
             for entity in created_entities:
                 if index_service.index_one(entity, commit=False):
                     indexed += 1
             self.db.commit()
+            for entity in created_entities:
+                self.db.refresh(entity)
+            entities_to_audit.extend(created_entities)
             logger.info(
                 "Embeddings generados para siniestros correo_id=%s indexed=%s total=%s",
                 correo.id,
@@ -344,17 +585,57 @@ class GmailIngestionService:
                 siniestros_creados,
             )
 
-        return siniestros_creados
+        return entities_to_audit
+
+    def _auto_audit_siniestros(self, siniestros: list[Siniestro]) -> list[dict[str, object]]:
+        if not siniestros:
+            return []
+
+        service = AutoScoringService(self.db)
+        audits: list[dict[str, object]] = []
+        seen: set[str] = set()
+
+        for siniestro in siniestros:
+            if siniestro.id_siniestro in seen:
+                continue
+            seen.add(siniestro.id_siniestro)
+            if siniestro.scoring_payload is not None:
+                continue
+            try:
+                self.db.refresh(siniestro)
+                response = service.audit_and_persist(siniestro)
+                audits.append(AutoScoringService.to_audit_summary(response))
+            except Exception:
+                logger.exception(
+                    "Error en auditoría automática id=%s",
+                    siniestro.id_siniestro,
+                )
+        return audits
+
+    def _audit_pending_siniestros(self) -> list[dict[str, object]]:
+        owner = self._resolve_owner_email()
+        pending = list(
+            self.db.scalars(
+                siniestro_scope(owner).where(Siniestro.scoring_payload.is_(None))
+            ).all()
+        )
+        return self._auto_audit_siniestros(pending)
 
     def _is_pdf_attachment(self, attachment: dict[str, str]) -> bool:
         filename = (attachment.get("filename") or "").lower()
         mime_type = (attachment.get("mime_type") or "").lower()
         return filename.endswith(".pdf") or mime_type == "application/pdf"
 
-    def _build_siniestro_entity(self, correo_id: int, parsed: ParsedSiniestroDraft) -> Siniestro:
+    def _build_siniestro_entity(
+        self,
+        correo_id: int,
+        parsed: ParsedSiniestroDraft,
+        id_siniestro: str | None = None,
+    ) -> Siniestro:
         return Siniestro(
+            owner_email=self._resolve_owner_email(),
             gmail_correo_id=correo_id,
-            id_siniestro=parsed.id_siniestro,
+            id_siniestro=id_siniestro or parsed.id_siniestro,
             id_poliza=parsed.id_poliza,
             id_asegurado=parsed.id_asegurado,
             ramo=parsed.ramo,

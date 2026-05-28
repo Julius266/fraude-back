@@ -11,13 +11,14 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
+from app.integrations.siniestros.fraud_rules_context import build_fraud_rules_prompt_section
 from app.models.gmail_correo import GmailCorreo
 from app.models.siniestro import Siniestro
 from app.schemas.scoring import ScoringAiExplanation, ScoringSignals
 
 logger = logging.getLogger(__name__)
 
-SYSTEM_PROMPT = """
+SYSTEM_PROMPT_BASE = """
 Eres un analista antifraude de seguros. Debes decidir UNICAMENTE estas senales booleanas:
 - evidencia_falsificacion_documental
 - coincidencia_lista_restrictiva
@@ -26,6 +27,9 @@ Eres un analista antifraude de seguros. Debes decidir UNICAMENTE estas senales b
 - narrativa_clonada
 
 Debes usar las herramientas cuando haga falta y explicar por que activas o no cada senal.
+Compara siempre el expediente actual con la biblioteca de casos de ejemplo incluida al final
+de estas instrucciones (reglas_fraude_ejemplos.md): esos casos son referencias adicionales
+de fraudes reales y sinteticos, no el siniestro en curso.
 Responde EXCLUSIVAMENTE JSON con esta estructura:
 {
   "signals": {
@@ -45,6 +49,10 @@ Responde EXCLUSIVAMENTE JSON con esta estructura:
   }
 }
 """.strip()
+
+
+def build_system_prompt() -> str:
+    return SYSTEM_PROMPT_BASE + build_fraud_rules_prompt_section()
 
 
 @dataclass
@@ -80,11 +88,12 @@ class AIScoringService:
         }
 
         messages: list[dict[str, Any]] = [
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": build_system_prompt()},
             {
                 "role": "user",
                 "content": (
-                    "Analiza este siniestro. Puedes llamar herramientas para evidencias adicionales.\n"
+                    "Analiza este siniestro (expediente actual). Puedes llamar herramientas para "
+                    "evidencias adicionales. Contrasta con los casos de ejemplo del system prompt.\n"
                     + json.dumps(base_context, ensure_ascii=True)
                 ),
             },
@@ -207,6 +216,17 @@ class AIScoringService:
             {
                 "type": "function",
                 "function": {
+                    "name": "get_fraud_rule_examples",
+                    "description": (
+                        "Devuelve casos de referencia RF-01..RF-07 de reglas_fraude_ejemplos.md "
+                        "(fraudes confirmados y casos limpios) para calibrar las senales."
+                    ),
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            },
+            {
+                "type": "function",
+                "function": {
                     "name": "explain_alerts",
                     "description": "Devuelve contexto explicativo util para justificar alertas.",
                     "parameters": {"type": "object", "properties": {}},
@@ -226,8 +246,10 @@ class AIScoringService:
         if tool_name == "retrieve_documents":
             return self._retrieve_documents(siniestro)
         if tool_name == "detect_narrative_similarity":
-            threshold = float(args.get("threshold", 0.9))
+            threshold = float(args.get("threshold", 0.85))
             return self._detect_narrative_similarity(siniestro, threshold)
+        if tool_name == "get_fraud_rule_examples":
+            return self._get_fraud_rule_examples()
         if tool_name == "explain_alerts":
             return self._explain_alerts(siniestro)
         return {"error": f"tool no soportada: {tool_name}"}
@@ -330,6 +352,17 @@ class AIScoringService:
             "max_similarity": max((item["similarity"] for item in hits), default=0.0),
         }
 
+    def _get_fraud_rule_examples(self) -> dict[str, Any]:
+        from app.integrations.siniestros.fraud_rules_context import load_fraud_rules_examples
+
+        content = load_fraud_rules_examples()
+        return {
+            "source": "reglas_fraude_ejemplos.md",
+            "purpose": "Casos adicionales de fraude y contraejemplos para calibrar RF-01..RF-07",
+            "content": content,
+            "available": bool(content.strip()),
+        }
+
     def _explain_alerts(self, siniestro: Siniestro) -> dict[str, Any]:
         return {
             "dias_entre_ocurrencia_reporte": siniestro.dias_entre_ocurrencia_reporte,
@@ -337,4 +370,5 @@ class AIScoringService:
             "dias_desde_fin_poliza": siniestro.dias_desde_fin_poliza,
             "ramo": siniestro.ramo,
             "cobertura": siniestro.cobertura,
+            "fraud_examples_doc": "reglas_fraude_ejemplos.md",
         }

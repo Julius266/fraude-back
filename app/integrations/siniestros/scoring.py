@@ -17,6 +17,20 @@ class ScoreComputation:
 class FraudScoringService:
     VERSION = "fraud-rules-v1"
 
+    # Pesos alineados con la matriz de auditoría del frontend (Clarity Card / mockClaims)
+    POINTS_RS01_CRITICAL = 8
+    POINTS_RS01_MODERATE = 4
+    POINTS_RF01 = 20
+    POINTS_RF02 = 22
+    POINTS_RF03 = 15
+    POINTS_RF04 = 25
+    POINTS_RF05 = 15
+    POINTS_RF06 = 8
+    POINTS_RF07 = 42
+
+    SCORE_BAND_ALTO = 71
+    SCORE_BAND_MEDIO = 36
+
     def calculate(self, siniestro: Siniestro, signals: ScoringSignals) -> ScoreComputation:
         rules: list[ScoringRuleResult] = []
 
@@ -57,11 +71,11 @@ class FraudScoringService:
             )
 
         if nearest_days <= 10:
-            points = 8
+            points = self.POINTS_RS01_CRITICAL
             matched = True
             reason = "Siniestro al borde de vigencia con <= 10 dias."
         elif nearest_days <= 30:
-            points = 4
+            points = self.POINTS_RS01_MODERATE
             matched = True
             reason = "Siniestro cercano al borde de vigencia entre 11 y 30 dias."
         else:
@@ -81,45 +95,49 @@ class FraudScoringService:
     def _rf_01_total_loss_robbery(self, siniestro: Siniestro) -> ScoringRuleResult:
         normalized = f"{siniestro.ramo} {siniestro.cobertura}".lower()
         matched = "robo" in normalized and "total" in normalized
+        points = self.POINTS_RF01 if matched else 0
         return ScoringRuleResult(
             code="RF-01",
             title="Cobertura Perdida Total por Robo (PTxRB)",
             classification="Rojo",
             matched=matched,
-            points=0,
+            points=points,
             reason="Detectado por palabras clave en ramo/cobertura." if matched else "No se detecta PTxRB en ramo/cobertura.",
         )
 
     def _rf_02_document_forgery(self, signals: ScoringSignals) -> ScoringRuleResult:
         matched = signals.evidencia_falsificacion_documental
+        points = self.POINTS_RF02 if matched else 0
         return ScoringRuleResult(
             code="RF-02",
             title="Evidencia de falsificacion o adulteracion documental",
             classification="Rojo",
             matched=matched,
-            points=0,
+            points=points,
             reason="Bandera de falsificacion activada por analista/sistema." if matched else "Sin evidencia de falsificacion reportada.",
         )
 
     def _rf_03_restrictive_list(self, signals: ScoringSignals) -> ScoringRuleResult:
         matched = signals.coincidencia_lista_restrictiva
+        points = self.POINTS_RF03 if matched else 0
         return ScoringRuleResult(
             code="RF-03",
             title="Coincidencia exacta con lista restrictiva",
             classification="Rojo",
             matched=matched,
-            points=0,
+            points=points,
             reason="Existe coincidencia exacta en lista restrictiva." if matched else "Sin coincidencias exactas en lista restrictiva.",
         )
 
     def _rf_04_physically_impossible(self, signals: ScoringSignals) -> ScoringRuleResult:
         matched = signals.dinamica_accidente_imposible
+        points = self.POINTS_RF04 if matched else 0
         return ScoringRuleResult(
             code="RF-04",
             title="Dinamica del accidente fisicamente imposible",
             classification="Rojo",
             matched=matched,
-            points=0,
+            points=points,
             reason="La dinamica fue marcada como fisicamente imposible." if matched else "Sin marca de imposibilidad fisica.",
         )
 
@@ -136,12 +154,13 @@ class FraudScoringService:
             )
 
         matched = nearest_days <= 2
+        points = self.POINTS_RF05 if matched else 0
         return ScoringRuleResult(
             code="RF-05",
             title="Siniestro extremo al borde de vigencia (<48 hrs)",
             classification="Amarillo",
             matched=matched,
-            points=0,
+            points=points,
             reason="Siniestro dentro de 48 horas del borde de vigencia." if matched else "No ocurre dentro de 48 horas del borde de vigencia.",
         )
 
@@ -163,39 +182,40 @@ class FraudScoringService:
 
     def _rf_06_theft_report_delay(self, signals: ScoringSignals) -> ScoringRuleResult:
         matched = signals.demora_atipica_denuncia_robo
+        points = self.POINTS_RF06 if matched else 0
         return ScoringRuleResult(
             code="RF-06",
             title="Demora atipica en denuncia de robo (> 4 dias)",
             classification="Amarillo",
             matched=matched,
-            points=0,
+            points=points,
             reason="Existe demora atipica en la denuncia del robo." if matched else "Sin demora atipica reportada.",
         )
 
     def _rf_07_cloned_narrative(self, signals: ScoringSignals) -> ScoringRuleResult:
         matched = signals.narrativa_clonada
+        points = self.POINTS_RF07 if matched else 0
         return ScoringRuleResult(
             code="RF-07",
             title="Narrativa identica (clonada)",
             classification="Amarillo",
             matched=matched,
-            points=0,
+            points=points,
             reason="Se detecto narrativa clonada frente a otros casos." if matched else "No hay evidencia de narrativa clonada.",
         )
 
     def _resolve_score_color(self, rules: list[ScoringRuleResult], total_score: int) -> str:
-        if any(rule.matched and rule.classification == "Rojo" for rule in rules):
+        """Color derivado del puntaje total: a mayor score, mayor severidad."""
+        if total_score >= self.SCORE_BAND_ALTO:
             return "Rojo"
-        if any(rule.matched and rule.classification == "Amarillo" for rule in rules):
-            return "Amarillo"
-        if total_score > 0:
+        if total_score >= self.SCORE_BAND_MEDIO:
             return "Amarillo"
         return "Verde"
 
     def _resolve_score_band(self, total_score: int) -> str:
-        if total_score >= 8:
+        if total_score >= self.SCORE_BAND_ALTO:
             return "Alto"
-        if total_score >= 4:
+        if total_score >= self.SCORE_BAND_MEDIO:
             return "Medio"
         return "Bajo"
 
