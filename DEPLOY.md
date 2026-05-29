@@ -170,6 +170,33 @@ railway redeploy --service fraude-back -y
 
 ---
 
+## Despliegue automático (push a `main`)
+
+Cada commit en `main` puede actualizar producción sin correr scripts a mano.
+
+### Opción A — Recomendada: GitHub en Railway (sin Actions)
+
+1. Repo: `https://github.com/Julius266/fraude-back`
+2. [Railway Dashboard](https://railway.app) → proyecto **fraude-back** → servicio **fraude-back**
+3. **Settings → Source → Connect Repo** → rama **`main`**
+4. Activa **Deploy on push**
+
+Flujo: `git push origin main` → Railway construye con el `Dockerfile` y despliega.
+
+> Las variables de entorno siguen en Railway (`.env.despliegue` es plantilla local).
+
+### Opción B — GitHub Actions
+
+Archivo: `.github/workflows/deploy-railway.yml`
+
+1. Token en [Railway → Account → Tokens](https://railway.app/account/tokens)
+2. GitHub → **fraude-back** → **Settings → Secrets → Actions** → `RAILWAY_TOKEN`
+3. Push a `main` dispara el workflow
+
+Si usas **Opción A**, desactiva el workflow para no desplegar dos veces.
+
+---
+
 ## Verificar que funciona
 
 ```powershell

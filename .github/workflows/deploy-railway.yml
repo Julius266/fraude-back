@@ -1,0 +1,31 @@
+# Despliega el backend en Railway en cada push a main.
+# Requiere secret: RAILWAY_TOKEN → https://railway.app/account/tokens
+name: Deploy backend (Railway)
+
+on:
+  push:
+    branches: [main]
+
+concurrency:
+  group: railway-fraude-back-production
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install Railway CLI
+        run: npm install -g @railway/cli
+
+      - name: Deploy to Railway
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+        run: railway up --detach --service fraude-back
