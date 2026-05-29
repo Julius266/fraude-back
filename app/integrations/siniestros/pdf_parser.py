@@ -244,7 +244,7 @@ class SiniestroPdfParser:
                 return after_colon
 
         cleaned = re.sub(re.escape(label_compact), "", compact_line, flags=re.IGNORECASE).strip()
-        if cleaned:
+        if cleaned and re.search(r"[A-Z0-9]", cleaned):
             return self._restore_readable(cleaned)
         return None
 

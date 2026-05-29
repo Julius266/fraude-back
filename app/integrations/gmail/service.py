@@ -505,6 +505,7 @@ class GmailIngestionService:
             for parsed in parsed_siniestros:
                 owner = self._resolve_owner_email()
                 base_id = parsed.id_siniestro.split("|")[0].strip()
+                target_id = parsed.id_siniestro.strip() or base_id
 
                 linked = self._siniestro_already_linked_to_correo(correo.id, base_id)
                 if linked is not None:
@@ -512,20 +513,8 @@ class GmailIngestionService:
                         entities_to_audit.append(linked)
                     continue
 
-                variant_id = self._correo_variant_id(base_id, owner, correo.id)
-                existing_variant = self.db.scalar(
-                    select(Siniestro).where(Siniestro.id_siniestro == variant_id)
-                )
-                if existing_variant is not None:
-                    if existing_variant.gmail_correo_id is None:
-                        existing_variant.gmail_correo_id = correo.id
-                        self.db.commit()
-                    if existing_variant.scoring_payload is None:
-                        entities_to_audit.append(existing_variant)
-                    continue
-
                 existing = self.db.scalar(
-                    select(Siniestro).where(Siniestro.id_siniestro == parsed.id_siniestro)
+                    select(Siniestro).where(Siniestro.id_siniestro == target_id)
                 )
                 if existing is not None:
                     if not existing.owner_email:
@@ -548,18 +537,19 @@ class GmailIngestionService:
                             entities_to_audit.append(existing)
                         continue
 
-                    scoped_id = self._analyst_scoped_id(base_id, owner)
+                    scoped_id = self._analyst_scoped_id(target_id, owner)
                     existing_clone = self.db.scalar(
                         select(Siniestro).where(Siniestro.id_siniestro == scoped_id)
                     )
-                    if existing_clone is not None and existing_clone.gmail_correo_id == correo.id:
+                    if existing_clone is not None:
+                        if existing_clone.gmail_correo_id is None:
+                            existing_clone.gmail_correo_id = correo.id
+                            self.db.commit()
                         if existing_clone.scoring_payload is None:
                             entities_to_audit.append(existing_clone)
                         continue
 
-                    target_id = variant_id
-                    if existing_clone is None and existing.owner_email != owner:
-                        target_id = scoped_id
+                    target_id = scoped_id
 
                     logger.info(
                         "Creando siniestro desde correo base=%s target=%s owner=%s correo_id=%s",
@@ -581,7 +571,7 @@ class GmailIngestionService:
                 entity = self._build_siniestro_entity(
                     correo.id,
                     parsed,
-                    id_siniestro=variant_id,
+                    id_siniestro=target_id,
                 )
                 self.db.add(entity)
                 created_entities.append(entity)
