@@ -1,261 +1,78 @@
-# fraude-back
+# fraude-back — ShieldMind API
 
-API backend en **FastAPI** para:
+Backend en **FastAPI** para **ShieldMind AI** (Aseguradora del Sur): ingesta de correos Gmail, extracción de siniestros desde PDFs, **scoring antifraude** y **copiloto RAG** para analistas.
 
-- Ingestión de correos de **Gmail** (watch Pub/Sub, escaneo manual, adjuntos PDF).
-- Persistencia de **siniestros** extraídos de PDFs.
-- **Scoring de fraude** por reglas y con **OpenAI** (opcional).
-
-Ejecución **local con Python** (sin Docker).
-
----
-
-## Requisitos
-
-| Componente | Obligatorio | Notas |
-|------------|-------------|--------|
-| Python 3.11+ | Sí | |
-| PostgreSQL o Neon | Sí | URL en `DATABASE_URL` |
-| `credentials.json` (Google OAuth) | Para Gmail | Proyecto con Gmail API habilitada |
-| `token.json` | Para Gmail | Se genera en el primer uso OAuth |
-| Tópico Pub/Sub + `GMAIL_WATCH_TOPIC` | Para push en tiempo real | Mismo `project_id` que `credentials.json` |
-| `OPENAI_API_KEY` | Solo scoring IA | |
+| Entorno | URL |
+|---------|-----|
+| Producción | https://fraude-back-production.up.railway.app |
+| Swagger | https://fraude-back-production.up.railway.app/swagger |
+| Frontend | https://fraude-front.vercel.app |
 
 ---
 
-## Inicio rápido
+## Tabla de contenidos
 
-```powershell
-# 1. Entrar al proyecto
-cd ruta\a\fraude-back
-
-# 2. Entorno virtual (solo la primera vez; si .venv ya existe, omite python -m venv)
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-
-# 3. Variables de entorno
-copy .env.example .env
-# Edita .env con tu DATABASE_URL, GMAIL_WATCH_TOPIC, OPENAI_API_KEY, etc.
-
-# 4. Migraciones
-alembic upgrade head
-
-# 5. Servidor (recomendado: comando unico que limpia procesos viejos)
-.\scripts\dev-up.ps1
-```
-
-Abre **http://127.0.0.1:8000/swagger** para probar la API.
-
-En macOS/Linux sustituye la activación del venv por `source .venv/bin/activate`.
+1. [Qué hace el sistema](#qué-hace-el-sistema)
+2. [Stack y arquitectura](#stack-y-arquitectura)
+3. [Estructura del proyecto](#estructura-del-proyecto)
+4. [Requisitos](#requisitos)
+5. [Inicio rápido (local)](#inicio-rápido-local)
+6. [Variables de entorno](#variables-de-entorno)
+7. [Autenticación Gmail (OAuth)](#autenticación-gmail-oauth)
+8. [Módulos principales](#módulos-principales)
+9. [Referencia de API](#referencia-de-api)
+10. [Scoring antifraude](#scoring-antifraude)
+11. [Plantillas de correo](#plantillas-de-correo)
+12. [Scripts útiles](#scripts-útiles)
+13. [Despliegue](#despliegue)
+14. [Problemas frecuentes](#problemas-frecuentes)
+15. [Documentación adicional](#documentación-adicional)
 
 ---
 
-## 🌟 Características Principales
+## Qué hace el sistema
 
-1. **Ingestión Inteligente de Gmail:** Ingestión en tiempo real mediante notificaciones Pub/Sub o escaneos manuales. El motor normaliza el texto, filtra spam y detecta palabras de intención de reclamos.
-2. **Ciclo de Auto-Respuesta Resiliente:** Si un cliente expresa intención de reportar un siniestro pero no adjunta la documentación oficial, el sistema le responde en segundos adjuntando la plantilla formal y creando un hilo de conversación de seguimiento.
-3. **Mapeo y Parseo de Adjuntos (DOCX, PDF, TXT):**
-   * **Archivos TXT:** Lectura directa ultrarrápida.
-   * **Archivos PDF:** Extracción de texto estructurado nativo y procesamiento de imágenes con **OCR** (Tesseract) si el PDF es escaneado.
-   * La IA analiza la estructura del documento y extrae con precisión matemática los **20 campos del modelo de base de datos**.
-4. **Motor de Scoring de Fraude Dual:**
-   * **Reglas Deterministas:** Validaciones basadas en límites de negocio (saturación de montos, vigencia de pólizas, sucursales sospechosas).
-   * **IA Generativa (OpenAI GPT):** Análisis semántico y lingüístico del relato del cliente para detectar incoherencias, similitudes sospechosas y patrones de fraude.
-5. **Copiloto AI con RAG (Retrieval-Augmented Generation):** Indexación automática de los siniestros en vectores. El analista puede preguntar en lenguaje natural sobre cualquier siniestro en el dashboard y el copiloto responderá citando los siniestros relevantes como contexto.
+Flujo típico de un analista:
+
+```
+Login Google (OAuth) → Escaneo Gmail → PDF/TXT en adjuntos
+        → Parseo de campos → Siniestro en PostgreSQL
+        → Scoring (reglas + IA opcional) → Bandeja en el front
+        → Copiloto RAG responde preguntas sobre los casos
+```
+
+| Capacidad | Descripción |
+|-----------|-------------|
+| **Ingestión Gmail** | Busca correos con palabras clave (`SINIESTRO`, `RECLAMO`, …), guarda metadatos y descarga adjuntos. |
+| **Parseo de documentos** | Extrae ~20 campos de PDF (texto nativo u OCR), TXT o DOCX hacia el modelo `Siniestro`. |
+| **Auto-respuesta** | Si el cliente escribe sin adjunto oficial, puede enviar plantilla de siniestro por Gmail. |
+| **Scoring dual** | Reglas deterministas (RS-XX) + análisis OpenAI opcional; semáforo Rojo / Amarillo / Verde. |
+| **Copiloto RAG** | Embeddings en PostgreSQL (pgvector); chat en lenguaje natural sobre siniestros indexados. |
+| **Multi-usuario** | Cada analista tiene su token OAuth y sus siniestros/correos filtrados por `owner_email`. |
+| **Watch Pub/Sub** | Notificaciones push de Gmail para procesar correos nuevos (opcional en producción). |
 
 ---
 
-## 📂 Sistema de Plantillas de Siniestro
+## Stack y arquitectura
 
-El backend cuenta con un sistema flexible para adjuntar archivos oficiales en la auto-respuesta. El directorio designado es:
-📁 **`storage/templates/`**
+| Capa | Tecnología |
+|------|------------|
+| API | FastAPI, Uvicorn, Pydantic Settings |
+| Base de datos | PostgreSQL (Neon en prod) + Alembic |
+| Vectores | pgvector (embeddings para chat) |
+| Gmail | Google OAuth 2.0, Gmail API, Pub/Sub |
+| IA | OpenAI (scoring, chat, embeddings) |
+| PDF/OCR | pdfplumber, Tesseract (opcional) |
 
-### Formatos Soportados (Orden de Prioridad):
-El backend busca automáticamente en la carpeta y adjunta el formato de mayor calidad disponible:
-1. **`plantilla_siniestro.docx` (Word):** Si existe, se enviará como archivo Word adjunto.
-2. **`plantilla_siniestro.pdf` (PDF):** Si no hay Word, pero existe este PDF, se enviará el PDF.
-3. **`plantilla_siniestro.txt` (Texto Fallback):** Si no hay ninguno, el backend genera dinámicamente un archivo `.txt` para evitar que el flujo se detenga.
-
-> [!TIP]
-> **Ubicación Física:** Coloca tus plantillas de marca corporativa Aseguradora del Sur en `fraude-back/storage/templates/`. El sistema las detectará de inmediato sin reiniciar el servidor.
-
----
-
-## 📋 Requisitos Previos
-
-Asegúrate de contar con las siguientes tecnologías e integraciones instaladas y configuradas:
-
-| Componente | Requerimiento | Descripción / Ubicación |
-| :--- | :--- | :--- |
-| **Python** | Versión 3.11 o superior | Intérprete oficial para ejecutar el backend. |
-| **PostgreSQL** | Local o en la nube (Neon.tech) | Base de datos relacional para guardar siniestros y estados. |
-| **Credenciales Google** | `credentials.json` | Archivo de credenciales de escritorio descargado desde Google Cloud Console. |
-| **Token de Acceso** | `token.json` | Generado automáticamente en el navegador durante el primer inicio de sesión de Gmail. |
-| **Google Pub/Sub** | `GMAIL_WATCH_TOPIC` | Tópico para recibir alertas de nuevos correos en tiempo real. |
-| **OpenAI Key** | `OPENAI_API_KEY` | API Key de OpenAI para el análisis de riesgo IA y el Chat Copiloto RAG. |
-
----
-
-## ⚙️ Configuración de Variables de Entorno (`.env`)
-
-Crea un archivo `.env` en la raíz de la carpeta `fraude-back/` basándote en `.env.example`:
-
-```env
-APP_NAME=ShieldMind Backend
-APP_ENV=development
-API_V1_STR=/api/v1
-APP_BASE_URL=http://127.0.0.1:8000
-FRONTEND_URL=http://localhost:3000
-
-# Base de Datos (PostgreSQL)
-DATABASE_URL=postgresql+psycopg2://fraude_user:fraude_pass@localhost:5432/fraude_back
-# NOTA: Si usas Neon.tech u otro proveedor remoto con SSL, añade ?sslmode=require al final.
-
-# Configuración Gmail
-GMAIL_CLIENT_SECRET_FILE=credentials.json
-GMAIL_TOKEN_FILE=token.json
-GMAIL_DOWNLOAD_DIR=storage/gmail_attachments
-GMAIL_WATCH_TOPIC=projects/tu-proyecto-google/topics/tu-topico-gmail
-GMAIL_KEYWORDS=SINIESTRO,RECLAMO
-
-# Configuración OpenAI e IA
-OPENAI_API_KEY=tu_openai_api_key_aqui
-OPENAI_MODEL=gpt-4
-EMBEDDING_MODEL=text-embedding-3-small
 ```
-
----
-
-## 🚀 Inicio Rápido (Comandos de Ejecución)
-
-Sigue estos sencillos pasos en tu consola de PowerShell (en Windows):
-
-### 1. Preparar el Entorno Virtual e Instalar Dependencias
-```powershell
-cd ruta\a\fraude-back
-.\scripts\dev-up.ps1
-```
-
-Este script:
-- libera puertos 8000, 8001 y 8002;
-- arranca **solo un** backend en `http://127.0.0.1:8000`;
-- evita tener multiples uvicorn al mismo tiempo.
-
-Para detener todo:
-
-```powershell
-.\scripts\dev-down.ps1
-```
-
-Alternativa manual:
-
-```powershell
-cd ruta\a\fraude-back
-.\.venv\Scripts\Activate.ps1
-
-# Instalar los paquetes y dependencias del sistema
-pip install -r requirements.txt
-```
-
-### 2. Ejecutar Migraciones de Base de Datos
-```powershell
-.\.venv\Scripts\uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
-```
-
-### Documentación interactiva
-
-| URL | Descripción |
-|-----|-------------|
-| http://127.0.0.1:8000/ | Redirige a Swagger |
-| http://127.0.0.1:8000/swagger | Swagger UI |
-| http://127.0.0.1:8000/redoc | ReDoc |
-| http://127.0.0.1:8000/openapi.json | Esquema OpenAPI |
-| http://127.0.0.1:8000/health | Health check |
-
-### Logs y errores
-
-- Los logs se escriben en la **misma terminal** donde corre uvicorn (`INFO`, `ERROR`, tracebacks).
-- Las respuestas de error suelen ser JSON: `{ "detail": "..." }`.
-- Errores de Google API incluyen `"source": "google_api"`.
-
----
-
-## Referencia de endpoints
-
-Prefijo base: **`/api/v1`**
-
-### Sistema
-
-| Método | Ruta | Descripción |
-|--------|------|-------------|
-| `GET` | `/health` | Estado del servicio |
-
-### Siniestros
-
-| Método | Ruta | Descripción |
-|--------|------|-------------|
-| `GET` | `/siniestros/status` | Estado del módulo |
-| `GET` | `/siniestros` | Listar siniestros (`limit`, `offset`) |
-| `GET` | `/siniestros/{id_siniestro}` | Detalle por ID |
-| `POST` | `/siniestros/{id_siniestro}/score` | Scoring por reglas |
-| `POST` | `/siniestros/{id_siniestro}/score/ai` | Scoring con IA + reglas |
-
-### Gmail
-
-| Método | Ruta | Descripción |
-|--------|------|-------------|
-| `GET` | `/gmail/config` | Config Gmail cargada en este proceso |
-| `POST` | `/gmail/watch/register` | Registrar watch en Gmail + guardar `historyId` |
-| `POST` | `/gmail/scan` | Buscar correos recientes por palabras clave |
-| `GET` | `/gmail/correos` | Listar correos persistidos (`limit`) |
-
-### Webhooks
-
-| Método | Ruta | Descripción |
-|--------|------|-------------|
-| `POST` | `/webhooks/gmail/push` | Payload Pub/Sub (base64) desde Google |
-
-### Chat RAG
-
-| Método | Ruta | Descripción |
-|--------|------|-------------|
-| `GET` | `/chat/index/status` | Estado de indexación de embeddings (total/indexados/pendientes) |
-| `POST` | `/chat/index` | Indexa embeddings pendientes en `siniestros` |
-| `POST` | `/chat/query` | Consulta en lenguaje natural sobre siniestros indexados |
-| `DELETE` | `/chat/session/{session_id}` | Limpia historial de una sesión de chat |
-
-### Ejemplos (curl / Bruno)
-
-Verificar configuración Gmail:
-
-```http
-GET http://127.0.0.1:8000/api/v1/gmail/config
-```
-
-Registrar watch:
-
-```http
-POST http://127.0.0.1:8000/api/v1/gmail/watch/register
-```
-
-Escaneo manual:
-
-```http
-POST http://127.0.0.1:8000/api/v1/gmail/scan
-```
-
-Consulta de chat:
-
-```http
-POST http://127.0.0.1:8000/api/v1/chat/query
-Content-Type: application/json
-
-{
-  "question": "Cuales son los casos mas riesgosos y por que?",
-  "session_id": "demo-analista",
-  "k": 8
-}
+Cliente (Next.js)  ──HTTP/CORS──►  fraude-back (/api/v1)
+                                        │
+                    ┌───────────────────┼───────────────────┐
+                    ▼                   ▼                   ▼
+              PostgreSQL           Gmail API            OpenAI
+              (siniestros,         (OAuth por           (score,
+               oauth tokens,         analista)            chat,
+               embeddings)                               embed)
 ```
 
 ---
@@ -265,83 +82,307 @@ Content-Type: application/json
 ```text
 fraude-back/
 ├── app/
-│   ├── main.py                 # FastAPI, Swagger, manejo de errores
-│   ├── api/v1/
-│   │   ├── router.py
-│   │   └── endpoints/
-│   │       ├── gmail.py
-│   │       ├── siniestros.py
-│   │       └── webhooks.py
+│   ├── main.py                 # App FastAPI, CORS, Swagger, lifespan
+│   ├── api/
+│   │   ├── deps.py             # Header X-Analyst-Email, scope por usuario
+│   │   ├── owner_scope.py      # Filtros owner_email en consultas
+│   │   └── v1/endpoints/
+│   │       ├── siniestros.py   # CRUD, scoring, email, status
+│   │       ├── gmail.py        # OAuth, scan, correos, watch
+│   │       ├── chat.py         # RAG: query, index, sesiones
+│   │       └── webhooks.py     # Pub/Sub push de Gmail
 │   ├── core/
 │   │   ├── config.py           # Settings desde .env
-│   │   ├── logging_config.py
-│   │   └── exceptions.py       # Errores Google API, validación topic
-│   ├── db/
-│   ├── models/
-│   ├── schemas/
+│   │   ├── exceptions.py       # Errores Google API formateados
+│   │   └── bootstrap.py        # Arranque / migraciones legacy
+│   ├── db/                     # SQLAlchemy session, base
+│   ├── models/                 # Siniestro, GmailCorreo, OAuth token, chat…
+│   ├── schemas/                # DTOs Pydantic (request/response)
 │   └── integrations/
-│       ├── gmail/              # Cliente OAuth + ingestión
-│       └── siniestros/         # PDF, scoring, IA
-├── alembic/
-├── storage/                    # Adjuntos (gitignored)
-├── credentials.json            # OAuth Google (gitignored)
-├── token.json                  # Token OAuth (gitignored)
-├── .env                        # Config local (gitignored)
-├── .env.example
-├── requirements.txt
+│       ├── gmail/              # OAuth, cliente API, ingestión, service
+│       ├── siniestros/         # PDF parser, scoring, IA, plantillas email
+│       └── chat/               # Embeddings, vector search, ChatService
+├── alembic/                    # Migraciones de BD
+├── storage/
+│   ├── gmail_attachments/      # PDFs descargados (gitignored)
+│   └── templates/              # Plantillas auto-respuesta (docx/pdf/txt)
+├── scripts/
+│   ├── dev-up.ps1              # Levanta uvicorn en :8000
+│   └── railway-deploy.ps1      # Deploy a Railway
+├── credentials.json            # OAuth Google Web (local, gitignored)
+├── Dockerfile
+├── DEPLOY.md                   # Guía Railway + Google Cloud
 └── README.md
 ```
+
+### Qué hace cada carpeta clave
+
+| Ruta | Responsabilidad |
+|------|-----------------|
+| `app/integrations/gmail/oauth.py` | Flujo OAuth, tokens en BD (`gmail_oauth_tokens`), scopes `gmail.readonly` + `gmail.send`. |
+| `app/integrations/gmail/service.py` | Escaneo, auto-respuesta, reprocesar PDFs de un correo. |
+| `app/integrations/siniestros/scoring.py` | Motor de reglas RS-XX y puntaje total. |
+| `app/integrations/siniestros/auto_scoring.py` | Auditoría automática al crear/actualizar siniestros. |
+| `app/integrations/chat/` | Indexación de embeddings y respuestas RAG. |
+| `app/api/deps.py` | Exige header `X-Analyst-Email` en rutas protegidas. |
+
+---
+
+## Requisitos
+
+| Componente | ¿Obligatorio? | Para qué |
+|------------|---------------|----------|
+| Python 3.11+ | Sí | Runtime |
+| PostgreSQL / Neon | Sí | Siniestros, tokens OAuth, chat, vectores |
+| `credentials.json` (OAuth **Web**) | Para Gmail | Login y escaneo de bandeja |
+| `OPENAI_API_KEY` | Recomendado | Scoring IA + copiloto + embeddings |
+| `GMAIL_WATCH_TOPIC` | Opcional | Push en tiempo real vía Pub/Sub |
+| Tesseract | Opcional | OCR en PDFs escaneados |
+
+---
+
+## Inicio rápido (local)
+
+### 1. Clonar e instalar
+
+```powershell
+cd D:\work\fraude-back
+python -m venv .venv          # solo la primera vez
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+```
+
+### 2. Configurar entorno
+
+Crea `.env` en la raíz (usa los valores de ejemplo abajo). Coloca `credentials.json` (cliente OAuth **Web** de Google Cloud).
+
+### 3. Base de datos
+
+```powershell
+alembic upgrade head
+```
+
+### 4. Arrancar API
+
+```powershell
+.\scripts\dev-up.ps1
+```
+
+Abre **http://127.0.0.1:8000/swagger**.
+
+Para detener:
+
+```powershell
+.\scripts\dev-down.ps1
+```
+
+### URLs locales útiles
+
+| URL | Uso |
+|-----|-----|
+| http://127.0.0.1:8000/swagger | Probar endpoints |
+| http://127.0.0.1:8000/health | Health check |
+| http://127.0.0.1:8000/api/v1/gmail/config | Ver redirect OAuth activo |
+
+---
+
+## Variables de entorno
+
+| Variable | Descripción | Ejemplo local |
+|----------|-------------|---------------|
+| `APP_ENV` | `development` o `production` (afecta CORS regex Vercel) | `development` |
+| `APP_BASE_URL` | URL pública del API | `http://127.0.0.1:8000` |
+| `FRONTEND_URL` | Front para redirect post-OAuth | `http://localhost:3000` |
+| `ALLOWED_ORIGINS` | Orígenes CORS separados por coma | `http://localhost:3000` |
+| `DATABASE_URL` | PostgreSQL (Neon: añade `?sslmode=require`) | `postgresql+psycopg2://...` |
+| `GMAIL_CLIENT_SECRET_FILE` | Ruta al JSON OAuth | `credentials.json` |
+| `GMAIL_TOKEN_FILE` | Legacy; prod usa BD + `/data/token.json` | `token.json` |
+| `GMAIL_OAUTH_REDIRECT_URI` | Callback OAuth (auto si local) | `http://127.0.0.1:8000/api/v1/gmail/auth/callback` |
+| `GMAIL_DOWNLOAD_DIR` | Carpeta de adjuntos | `storage/gmail_attachments` |
+| `GMAIL_WATCH_TOPIC` | Tópico Pub/Sub completo | `projects/.../topics/...` |
+| `GMAIL_KEYWORDS` | Palabras en asunto/cuerpo | `SINIESTRO,RECLAMO` |
+| `OPENAI_API_KEY` | Key OpenAI | `sk-...` |
+| `OPENAI_MODEL` | Modelo chat/scoring | `gpt-4.1` |
+| `EMBEDDING_MODEL` | Modelo embeddings | `text-embedding-3-small` |
+| `ENABLE_PDF_OCR` | OCR en PDFs imagen | `true` |
+
+En **Railway**, muchas variables van en `.env.despliegue` y se suben con el script de deploy. Ver [DEPLOY.md](./DEPLOY.md).
+
+---
+
+## Autenticación Gmail (OAuth)
+
+### Flujo
+
+1. El front llama `GET /api/v1/gmail/auth/url?returnTo=/`
+2. El usuario autoriza en Google
+3. Google redirige a `{APP_BASE_URL}/api/v1/gmail/auth/callback`
+4. El backend guarda tokens en `gmail_oauth_tokens` y redirige al front:  
+   `{FRONTEND_URL}/login?gmail=connected&email=...`
+
+### Header requerido
+
+Tras login, el front envía en cada petición:
+
+```http
+X-Analyst-Email: analista@gmail.com
+```
+
+El backend filtra siniestros y correos por ese email.
+
+### Permitir login de cualquier Gmail
+
+En Google Cloud → **Pantalla de consentimiento OAuth**:
+
+1. Completa nombre, email de soporte y **política de privacidad** (URL pública)
+2. Pulsa **Publicar aplicación** (pasar de *Testing* → *In production*)
+
+En modo Testing solo entran los **usuarios de prueba** (máx. 100).
+
+Con scopes Gmail, los usuarios verán *“Google hasn't verified this app”* → **Avanzado → Continuar** hasta completar verificación oficial.
+
+Detalle de URIs y Railway: [DEPLOY.md § Google Cloud](./DEPLOY.md#google-cloud--oauth-web).
+
+---
+
+## Módulos principales
+
+### Gmail (`/api/v1/gmail`)
+
+| Función | Endpoint |
+|---------|----------|
+| Estado OAuth del analista | `GET /auth/status` |
+| URL para iniciar login | `GET /auth/url` |
+| Callback (solo Google) | `GET /auth/callback` |
+| Cerrar sesión Gmail | `POST /auth/logout` |
+| Escanear bandeja | `POST /scan` |
+| Listar correos guardados | `GET /correos` |
+| PDF → siniestros en bandeja | `POST /correos/{id}/procesar` |
+| Registrar watch Pub/Sub | `POST /watch/register` |
+
+### Siniestros (`/api/v1/siniestros`)
+
+| Función | Endpoint |
+|---------|----------|
+| Resumen (totales, por color) | `GET /summary` |
+| Listar con score | `GET /` |
+| Detalle | `GET /{id}` |
+| Crear manual | `POST /` |
+| Scoring reglas | `POST /{id}/score` |
+| Scoring reglas + IA | `POST /{id}/score/ai` |
+| Cambiar estado (dictamen) | `PATCH /{id}/status` |
+| Re-auditar casos stale | `POST /reaudit-stale` |
+| Enviar correo al asegurado | `POST /{id}/send-email` |
+| Eliminar expediente | `DELETE /{id}` |
+
+### Chat RAG (`/api/v1/chat`)
+
+| Función | Endpoint |
+|---------|----------|
+| Pregunta en lenguaje natural | `POST /query` |
+| Indexar embeddings pendientes | `POST /index` |
+| Estado de indexación | `GET /index/status` |
+| Historial de sesión | `GET /session/{id}/messages` |
+| Limpiar sesión | `DELETE /session/{id}` |
+
+### Webhooks (`/api/v1/webhooks`)
+
+| Función | Endpoint |
+|---------|----------|
+| Push Pub/Sub de Gmail | `POST /gmail/push` |
+
+---
+
+## Scoring antifraude
+
+1. **Reglas (RS-XX)** — Validaciones de negocio: montos, vigencia, documentos, proveedores, etc.
+2. **IA (opcional)** — OpenAI analiza narrativa y señales semánticas.
+3. **Semáforo** — Puntos → Rojo / Amarillo / Verde (umbrales configurables en front y back).
+
+La auditoría automática corre al ingestar PDFs y en endpoints de re-auditoría. Versión de reglas referenciada en respuestas de scoring.
+
+Archivo de ejemplos de reglas: [`reglas_fraude_ejemplos.md`](./reglas_fraude_ejemplos.md).
+
+---
+
+## Plantillas de correo
+
+Carpeta: **`storage/templates/`**
+
+Prioridad al adjuntar en auto-respuesta:
+
+1. `plantilla_siniestro.docx`
+2. `plantilla_siniestro.pdf`
+3. Fallback generado: `plantilla_siniestro.txt`
+
+No hace falta reiniciar el servidor al cambiar archivos.
+
+---
+
+## Scripts útiles
+
+| Script | Qué hace |
+|--------|----------|
+| `scripts/dev-up.ps1` | Mata procesos en :8000 y levanta uvicorn con reload |
+| `scripts/dev-down.ps1` | Detiene el backend local |
+| `scripts/railway-deploy.ps1` | Sube variables y despliega a Railway |
+
+---
+
+## Despliegue
+
+Guía completa (Railway, Neon, Google OAuth Web, volúmenes, CI):
+
+**→ [DEPLOY.md](./DEPLOY.md)**
+
+Resumen:
+
+- API en **Railway** con Dockerfile
+- BD en **Neon**
+- OAuth JSON en `GOOGLE_OAUTH_CREDENTIALS_JSON`
+- Volumen `/data` para adjuntos y token legacy
 
 ---
 
 ## Problemas frecuentes
 
-### `Permission denied` al crear `.venv`
+### `redirect_uri_mismatch`
 
-El entorno **ya existe**. No ejecutes otra vez `python -m venv .venv`. Usa:
+La URI de callback en Google Cloud debe coincidir **exactamente** con `gmail_oauth_redirect_uri` de `/api/v1/gmail/config`.
 
-```powershell
-# Levanta el backend estrictamente en http://127.0.0.1:8000
-.\scripts\dev-up.ps1
-```
+### `403 access_denied` / “solo testers”
 
-Si deseas iniciarlo de manera manual:
-```powershell
-# Inicio manual con recarga en caliente (Hot Reload)
-uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
-```
+La app OAuth está en **Testing**. Publica la app o agrega el email en usuarios de prueba. Ver [Autenticación Gmail](#autenticación-gmail-oauth).
 
----
+### `credentials_configured: false` en producción
 
-## 🔍 Referencia de Endpoints y Documentación Interactiva
+Falta `GOOGLE_OAUTH_CREDENTIALS_JSON` en Railway o el redeploy no aplicó.
 
-Una vez que el servidor backend esté corriendo, puedes acceder a la documentación interactiva desde tu navegador:
-*   🛡️ **Swagger UI:** [http://127.0.0.1:8000/swagger](http://127.0.0.1:8000/swagger)
-*   🧠 **ReDoc:** [http://127.0.0.1:8000/redoc](http://127.0.0.1:8000/redoc)
+### CORS desde Vercel
 
-### Principales Endpoints de Integración:
+En producción: `APP_ENV=production`, `ALLOWED_ORIGINS` con URL del front. También acepta `https://*.vercel.app`.
 
-| Módulo | Tipo | Endpoint | Descripción |
-| :--- | :--- | :--- | :--- |
-| **Siniestros** | `GET` | `/api/v1/siniestros` | Lista todos los siniestros con paginación. |
-| **Siniestros** | `POST` | `/api/v1/siniestros/{id}/score/ai` | Evalúa reglas de fraude + análisis cognitivo OpenAI. |
-| **Gmail** | `POST` | `/api/v1/gmail/scan` | Escanea manualmente la bandeja de entrada de Gmail. |
-| **Webhooks** | `POST` | `/api/v1/webhooks/gmail/push` | Recibe la notificación Push de Google Pub/Sub. |
-| **Copiloto RAG** | `POST` | `/api/v1/chat/index` | Indexa los nuevos siniestros a la base vectorial. |
-| **Copiloto RAG** | `POST` | `/api/v1/chat/query` | Realiza consultas en lenguaje natural al Copiloto AI. |
+### Puerto 8000 ocupado
+
+Usa `.\scripts\dev-up.ps1` (libera puertos antes de arrancar).
+
+### Error Google API en JSON
+
+Las respuestas incluyen `"source": "google_api"`. Revisa permisos Gmail API y scopes OAuth.
 
 ---
 
-## 🛠️ Diagnóstico y Resolución de Problemas (FAQ)
+## Documentación adicional
 
-> [!WARNING]
-> **Error de Sintaxis al levantar Uvicorn:**
-> Si al levantar el servidor ves errores del tipo `SyntaxError: '(' was never closed` o similar, asegúrate de no tener bloques duplicados en el código. *Este backend ha sido saneado de raíz y ya no posee errores de compilación.*
+| Documento | Contenido |
+|-----------|-----------|
+| [DEPLOY.md](./DEPLOY.md) | Railway, variables, OAuth, CI |
+| [docs/PLAN_CHAT_RAG.md](./docs/PLAN_CHAT_RAG.md) | Diseño del copiloto RAG |
+| [docs/EMBEDDINGS_PGVECTOR.md](./docs/EMBEDDINGS_PGVECTOR.md) | Embeddings y pgvector |
+| [AGENTS.md](./AGENTS.md) | Notas para agentes / Docker compose |
 
-> [!IMPORTANT]
-> **Error `AttributeError: 'GmailIngestionService' object has no attribute '_send_auto_reply_template'`:**
-> Este error ocurre cuando la firma del método de auto-respuesta se borra de `service.py`. En la versión actual este problema está **100% corregido** y restaurado con una estructura limpia.
+---
 
-> [!CAUTION]
-> **Fallo de lectura de adjunto TXT en Reprocesamiento (`invalid pdf header`):**
-> Si subes o respondes con una plantilla `.txt`, la función de reprocesamiento histórico solía asumir erróneamente que todos los adjuntos eran PDFs. Hemos modificado la función `reprocess_correo_pdfs` para que valide la extensión `.txt` y la procese de forma inmediata como texto plano, ahorrando tiempo y eliminando la advertencia de error.
+## Licencia y uso
+
+Proyecto interno — Aseguradora del Sur / ShieldMind AI.

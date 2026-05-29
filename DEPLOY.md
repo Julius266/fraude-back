@@ -149,6 +149,19 @@ railway redeploy --service fraude-back -y
 
 Espera **5–10 minutos** para que Google aplique los cambios.
 
+### Pantalla de consentimiento — permitir cualquier Gmail
+
+Si los usuarios ven **403 access_denied** o *“only developer-approved testers”*, la app está en modo **Testing**.
+
+1. **APIs y servicios** → **Pantalla de consentimiento de OAuth**
+2. Completa: nombre, email de soporte, **política de privacidad** (URL pública obligatoria)
+3. **Dominios autorizados**: `vercel.app`, `up.railway.app`
+4. Pulsa **Publicar aplicación** (Testing → **In production**)
+
+Alternativa rápida (máx. 100 usuarios): agrega emails en **Usuarios de prueba**.
+
+Con scopes Gmail (`readonly`, `send`), Google mostrará *“Google hasn't verified this app”* hasta completar verificación oficial. Los usuarios pueden entrar con **Avanzado → Continuar**.
+
 ---
 
 ## Redeploy
