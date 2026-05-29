@@ -190,8 +190,8 @@ Flujo: `git push origin main` → Railway construye con el `Dockerfile` y despli
 Archivo: `.github/workflows/deploy-railway.yml`
 
 1. Token en [Railway → Account → Tokens](https://railway.app/account/tokens)
-2. GitHub → **fraude-back** → **Settings → Secrets → Actions** → `RAILWAY_TOKEN`
-3. Push a `main` dispara el workflow
+2. GitHub → **fraude-back** → **Settings → Secrets and variables → Actions**
+3. Secret **`RAILWAY_TOKEN`** (único obligatorio; el workflow ya incluye project/service ID)
 
 Si usas **Opción A**, desactiva el workflow para no desplegar dos veces.
 

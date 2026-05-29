@@ -1,5 +1,5 @@
 # Despliega el backend en Railway en cada push a main.
-# Requiere secret: RAILWAY_TOKEN → https://railway.app/account/tokens
+# Secret: RAILWAY_TOKEN → https://railway.app/account/tokens
 name: Deploy backend (Railway)
 
 on:
@@ -9,6 +9,11 @@ on:
 concurrency:
   group: railway-fraude-back-production
   cancel-in-progress: true
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  RAILWAY_PROJECT_ID: 8ba1bea5-2cd9-4439-bc70-fa6c073c4991
+  RAILWAY_SERVICE_ID: f866e98e-c6bc-4e89-913b-3c45e5eec137
 
 jobs:
   deploy:
@@ -20,12 +25,21 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "22"
 
       - name: Install Railway CLI
-        run: npm install -g @railway/cli
+        run: npm install -g @railway/cli@latest
 
       - name: Deploy to Railway
         env:
           RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
-        run: railway up --detach --service fraude-back
+        run: |
+          if [ -z "$RAILWAY_TOKEN" ]; then
+            echo "::error::Falta el secret RAILWAY_TOKEN en GitHub (Settings → Secrets → Actions)"
+            exit 1
+          fi
+          railway link \
+            -p "$RAILWAY_PROJECT_ID" \
+            -s "$RAILWAY_SERVICE_ID" \
+            -e production
+          railway up --detach --service fraude-back
