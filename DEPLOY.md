@@ -189,11 +189,24 @@ Flujo: `git push origin main` → Railway construye con el `Dockerfile` y despli
 
 Archivo: `.github/workflows/deploy-railway.yml`
 
-1. Token en [Railway → Account → Tokens](https://railway.app/account/tokens)
-2. GitHub → **fraude-back** → **Settings → Secrets and variables → Actions**
-3. Secret **`RAILWAY_TOKEN`** (único obligatorio; el workflow ya incluye project/service ID)
+#### Paso obligatorio: crear `RAILWAY_TOKEN`
 
-Si usas **Opción A**, desactiva el workflow para no desplegar dos veces.
+1. Abre [Railway → Account → Tokens](https://railway.app/account/tokens)
+2. **Create token** → nombre ej. `github-actions-fraude-back` → copia el token (solo se muestra una vez)
+3. Abre [GitHub → fraude-back → Secrets → Actions](https://github.com/Julius266/fraude-back/settings/secrets/actions)
+4. **New repository secret**
+   - Name: `RAILWAY_TOKEN`
+   - Secret: pega el token de Railway
+5. Push a `main` o re-ejecuta el workflow en **Actions → Deploy backend → Re-run jobs**
+
+Desde terminal (si tienes `gh auth login`):
+
+```powershell
+gh secret set RAILWAY_TOKEN --repo Julius266/fraude-back
+# pega el token cuando lo pida
+```
+
+Si usas **Opción A** (Connect Repo en Railway), desactiva o borra el workflow para no desplegar dos veces y **no necesitas** `RAILWAY_TOKEN`.
 
 ---
 
