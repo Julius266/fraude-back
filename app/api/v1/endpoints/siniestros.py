@@ -24,6 +24,8 @@ from app.schemas.siniestro import (
     SiniestroRead,
     SiniestrosSummary,
     SiniestroWithScoreRead,
+    SiniestroUpdateStatus,
+    SendCustomEmailRequest,
 )
 
 router = APIRouter(prefix="/siniestros", tags=["Siniestros"])
@@ -252,3 +254,100 @@ def score_siniestro_with_ai(
         siniestro,
         manual_signals=payload.manual_signals,
     )
+
+
+@router.patch("/{id_siniestro}/status", response_model=SiniestroWithScoreRead)
+def update_siniestro_status(
+    id_siniestro: str,
+    payload: SiniestroUpdateStatus,
+    db: Session = Depends(get_db),
+    owner_email: str = Depends(get_analyst_email),
+) -> SiniestroWithScoreRead:
+    siniestro = _find_siniestro(db, id_siniestro, owner_email=owner_email)
+    if not siniestro:
+        raise HTTPException(status_code=404, detail=f"Siniestro no encontrado: {id_siniestro}")
+
+    siniestro.estado = payload.estado
+    db.commit()
+    db.refresh(siniestro)
+
+    # Re-index claim to update status in vector database
+    try:
+        EmbeddingIndexService(db, owner_email=owner_email).index_one(siniestro)
+    except Exception:
+        pass
+
+    return _enrich_with_score(siniestro)
+
+
+@router.post("/send-custom-email", response_model=SendEmailResponse)
+def send_custom_siniestro_email(
+    payload: SendCustomEmailRequest,
+    db: Session = Depends(get_db),
+    owner_email: str = Depends(get_analyst_email),
+) -> SendEmailResponse:
+    from app.integrations.gmail.client import GmailClient
+    from app.integrations.gmail.oauth import load_valid_credentials
+    from app.core.config import get_settings
+
+    # 1. Buscar el siniestro
+    siniestro = _find_siniestro(db, payload.id_siniestro, owner_email=owner_email)
+    if not siniestro:
+        raise HTTPException(status_code=404, detail=f"Siniestro no encontrado: {payload.id_siniestro}")
+
+    # 2. Cargar credenciales y cliente de Gmail
+    try:
+        settings = get_settings()
+        creds = load_valid_credentials()
+        if not creds:
+            raise HTTPException(status_code=401, detail="No se encontraron credenciales de Gmail válidas.")
+        client = GmailClient(creds)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error al cargar el cliente de Gmail: {str(e)}")
+
+    # 3. Enviar el correo real por la API de Google Gmail
+    try:
+        thread_id = None
+        if siniestro.correo:
+            thread_id = siniestro.correo.gmail_message_id
+
+        client.send_email(
+            to=payload.to_email,
+            subject=payload.subject,
+            body_text="Favor revisar el formato de Ficha Registral HTML adjunto.",
+            html_body=payload.body_html,
+            thread_id=thread_id
+        )
+
+        return SendEmailResponse(
+            success=True,
+            message=f"Correo enviado exitosamente por Gmail a {payload.to_email}.",
+            htmlTemplate=payload.body_html
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error al transmitir correo vía Gmail API: {str(e)}")
+
+
+@router.delete("/{id_siniestro}", status_code=200)
+def delete_siniestro(
+    id_siniestro: str,
+    db: Session = Depends(get_db),
+    owner_email: str = Depends(get_analyst_email),
+) -> dict[str, str]:
+    siniestro = _find_siniestro(db, id_siniestro, owner_email=owner_email)
+    if not siniestro:
+        raise HTTPException(status_code=404, detail=f"Siniestro no encontrado: {id_siniestro}")
+
+    # 1. Borrar sesiones de chat asociadas a este siniestro
+    from app.models.chat_session import ChatSession
+    from sqlalchemy import delete
+    
+    clean_id = siniestro.id_siniestro.split("|")[0].strip()
+    session_pattern = f"%{clean_id}%"
+    db.execute(delete(ChatSession).where(ChatSession.session_id.like(session_pattern)))
+    
+    # 2. Borrar el siniestro
+    db.delete(siniestro)
+    db.commit()
+
+    return {"success": "true", "message": f"Siniestro {id_siniestro} y sus datos asociados eliminados exitosamente."}

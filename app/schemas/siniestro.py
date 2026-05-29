@@ -43,6 +43,7 @@ class SiniestroRead(SiniestroBase):
 
     owner_email: str | None = None
     gmail_correo_id: int | None = None
+    remitente_correo: str | None = None
 
 
 class SiniestroWithScoreRead(SiniestroRead):
@@ -74,3 +75,14 @@ class SendEmailResponse(BaseModel):
 
 class SendEmailRequest(BaseModel):
     id_siniestro: str = Field(..., min_length=1, max_length=50)
+
+
+class SiniestroUpdateStatus(BaseModel):
+    estado: str = Field(..., min_length=1, max_length=50)
+
+
+class SendCustomEmailRequest(BaseModel):
+    id_siniestro: str = Field(..., min_length=1, max_length=50)
+    to_email: str = Field(..., min_length=1, max_length=255)
+    subject: str = Field(..., min_length=1, max_length=255)
+    body_html: str = Field(...)

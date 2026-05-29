@@ -6,9 +6,7 @@ API backend en **FastAPI** para:
 - Persistencia de **siniestros** extraídos de PDFs.
 - **Scoring de fraude** por reglas y con **OpenAI** (opcional).
 
-Ejecución **local con Python** o **producción con Docker/Railway**.
-
-**Despliegue:** ver [DEPLOY.md](./DEPLOY.md)
+Ejecución **local con Python** (sin Docker).
 
 ---
 
@@ -32,8 +30,6 @@ Ejecución **local con Python** o **producción con Docker/Railway**.
 cd ruta\a\fraude-back
 
 # 2. Entorno virtual (solo la primera vez; si .venv ya existe, omite python -m venv)
-#    Importante: la carpeta debe llamarse .venv (con punto), no venv.
-#    .\scripts\dev-up.ps1 y el resto del README asumen esa ruta.
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
@@ -55,127 +51,94 @@ En macOS/Linux sustituye la activación del venv por `source .venv/bin/activate`
 
 ---
 
-## Variables de entorno
+## 🌟 Características Principales
 
-Copia `.env.example` a `.env`. Archivos sensibles (`.env`, `credentials.json`, `token.json`) están en `.gitignore`.
-
-| Variable | Descripción | Ejemplo |
-|----------|-------------|---------|
-| `APP_NAME` | Nombre de la app | `fraude-back` |
-| `APP_ENV` | Entorno (`development` muestra más detalle en errores) | `development` |
-| `API_V1_STR` | Prefijo de la API | `/api/v1` |
-| `DATABASE_URL` | Conexión PostgreSQL (SQLAlchemy + psycopg2) | ver abajo |
-| `SQLALCHEMY_ECHO` | Log SQL en consola | `false` |
-| `GMAIL_CLIENT_SECRET_FILE` | OAuth client secrets | `credentials.json` |
-| `GMAIL_TOKEN_FILE` | Token OAuth guardado | `token.json` |
-| `GMAIL_DOWNLOAD_DIR` | Carpeta de adjuntos | `storage/gmail_attachments` |
-| `GMAIL_WATCH_TOPIC` | Tópico Pub/Sub para Gmail push | `projects/MI_PROYECTO/topics/MI_TOPICO` |
-| `GMAIL_KEYWORDS` | Palabras clave (coma) | `SINIESTRO,RECLAMO` |
-| `GMAIL_QUERY_HOURS_BACK` | Horas hacia atrás en scan manual | `48` |
-| `GMAIL_MAX_RESULTS` | Máximo de mensajes por scan | `50` |
-| `ENABLE_PDF_OCR` | OCR en PDFs escaneados | `true` |
-| `OPENAI_API_KEY` | API key OpenAI | |
-| `OPENAI_MODEL` | Modelo OpenAI | `gpt-4.1` |
-| `EMBEDDING_MODEL` | Modelo para embeddings del chat RAG | `text-embedding-3-small` |
-| `CHAT_MODEL` | Modelo para respuestas del chat (opcional) | usa `OPENAI_MODEL` |
-| `CHAT_K_RESULTS` | Cantidad de siniestros recuperados por consulta | `8` |
-| `CHAT_MAX_HISTORY` | Turnos de historial por sesión | `10` |
-| `CHAT_SESSION_TTL_SECONDS` | TTL de sesión de chat en memoria | `1800` |
-
-### Base de datos
-
-**PostgreSQL local:**
-
-```env
-DATABASE_URL=postgresql+psycopg2://usuario:password@localhost:5432/fraude_back
-```
-
-**Neon (u otro host con SSL):**
-
-```env
-DATABASE_URL=postgresql+psycopg2://usuario:password@ep-xxx.neon.tech:5432/nombre_db?sslmode=require
-```
-
-### Prioridad de configuración
-
-1. Variables de entorno del sistema (p. ej. `GMAIL_WATCH_TOPIC` en Windows).
-2. Archivo `.env` en la raíz del proyecto.
-
-Si cambias `.env`, **reinicia uvicorn** (Ctrl+C y vuelve a ejecutar). `--reload` **no** recarga `.env` automáticamente.
+1. **Ingestión Inteligente de Gmail:** Ingestión en tiempo real mediante notificaciones Pub/Sub o escaneos manuales. El motor normaliza el texto, filtra spam y detecta palabras de intención de reclamos.
+2. **Ciclo de Auto-Respuesta Resiliente:** Si un cliente expresa intención de reportar un siniestro pero no adjunta la documentación oficial, el sistema le responde en segundos adjuntando la plantilla formal y creando un hilo de conversación de seguimiento.
+3. **Mapeo y Parseo de Adjuntos (DOCX, PDF, TXT):**
+   * **Archivos TXT:** Lectura directa ultrarrápida.
+   * **Archivos PDF:** Extracción de texto estructurado nativo y procesamiento de imágenes con **OCR** (Tesseract) si el PDF es escaneado.
+   * La IA analiza la estructura del documento y extrae con precisión matemática los **20 campos del modelo de base de datos**.
+4. **Motor de Scoring de Fraude Dual:**
+   * **Reglas Deterministas:** Validaciones basadas en límites de negocio (saturación de montos, vigencia de pólizas, sucursales sospechosas).
+   * **IA Generativa (OpenAI GPT):** Análisis semántico y lingüístico del relato del cliente para detectar incoherencias, similitudes sospechosas y patrones de fraude.
+5. **Copiloto AI con RAG (Retrieval-Augmented Generation):** Indexación automática de los siniestros en vectores. El analista puede preguntar en lenguaje natural sobre cualquier siniestro en el dashboard y el copiloto responderá citando los siniestros relevantes como contexto.
 
 ---
 
-## Migraciones (Alembic)
+## 📂 Sistema de Plantillas de Siniestro
 
-```powershell
-.\.venv\Scripts\Activate.ps1
-alembic upgrade head
-```
+El backend cuenta con un sistema flexible para adjuntar archivos oficiales en la auto-respuesta. El directorio designado es:
+📁 **`storage/templates/`**
 
-Crear migración tras cambiar modelos:
+### Formatos Soportados (Orden de Prioridad):
+El backend busca automáticamente en la carpeta y adjunta el formato de mayor calidad disponible:
+1. **`plantilla_siniestro.docx` (Word):** Si existe, se enviará como archivo Word adjunto.
+2. **`plantilla_siniestro.pdf` (PDF):** Si no hay Word, pero existe este PDF, se enviará el PDF.
+3. **`plantilla_siniestro.txt` (Texto Fallback):** Si no hay ninguno, el backend genera dinámicamente un archivo `.txt` para evitar que el flujo se detenga.
 
-```powershell
-alembic revision --autogenerate -m "descripcion"
-alembic upgrade head
-```
+> [!TIP]
+> **Ubicación Física:** Coloca tus plantillas de marca corporativa Aseguradora del Sur en `fraude-back/storage/templates/`. El sistema las detectará de inmediato sin reiniciar el servidor.
 
 ---
 
-## Gmail y Pub/Sub
+## 📋 Requisitos Previos
 
-### 1. OAuth (`credentials.json` + `token.json`)
+Asegúrate de contar con las siguientes tecnologías e integraciones instaladas y configuradas:
 
-1. En [Google Cloud Console](https://console.cloud.google.com/), crea o usa un proyecto.
-2. Habilita **Gmail API**.
-3. Crea credenciales OAuth (tipo aplicación de escritorio) y descárgalas como `credentials.json` en la raíz del repo.
-4. La primera llamada a un endpoint de Gmail puede abrir el navegador; se guardará `token.json`.
+| Componente | Requerimiento | Descripción / Ubicación |
+| :--- | :--- | :--- |
+| **Python** | Versión 3.11 o superior | Intérprete oficial para ejecutar el backend. |
+| **PostgreSQL** | Local o en la nube (Neon.tech) | Base de datos relacional para guardar siniestros y estados. |
+| **Credenciales Google** | `credentials.json` | Archivo de credenciales de escritorio descargado desde Google Cloud Console. |
+| **Token de Acceso** | `token.json` | Generado automáticamente en el navegador durante el primer inicio de sesión de Gmail. |
+| **Google Pub/Sub** | `GMAIL_WATCH_TOPIC` | Tópico para recibir alertas de nuevos correos en tiempo real. |
+| **OpenAI Key** | `OPENAI_API_KEY` | API Key de OpenAI para el análisis de riesgo IA y el Chat Copiloto RAG. |
 
-### 2. Tópico Pub/Sub (`GMAIL_WATCH_TOPIC`)
+---
 
-El valor debe coincidir con el **`project_id`** de `credentials.json`:
+## ⚙️ Configuración de Variables de Entorno (`.env`)
 
-```json
-"project_id": "fraudia"
-```
+Crea un archivo `.env` en la raíz de la carpeta `fraude-back/` basándote en `.env.example`:
 
 ```env
-GMAIL_WATCH_TOPIC=projects/fraudia/topics/fraudia
-```
+APP_NAME=ShieldMind Backend
+APP_ENV=development
+API_V1_STR=/api/v1
+APP_BASE_URL=http://127.0.0.1:8000
+FRONTEND_URL=http://localhost:3000
 
-En Google Cloud:
+# Base de Datos (PostgreSQL)
+DATABASE_URL=postgresql+psycopg2://fraude_user:fraude_pass@localhost:5432/fraude_back
+# NOTA: Si usas Neon.tech u otro proveedor remoto con SSL, añade ?sslmode=require al final.
 
-1. **Pub/Sub → Topics → Create topic** (mismo proyecto que OAuth).
-2. En el tópico → **Permissions** → agregar principal  
-   `gmail-api-push@system.gserviceaccount.com` con rol **Pub/Sub Publisher**.
+# Configuración Gmail
+GMAIL_CLIENT_SECRET_FILE=credentials.json
+GMAIL_TOKEN_FILE=token.json
+GMAIL_DOWNLOAD_DIR=storage/gmail_attachments
+GMAIL_WATCH_TOPIC=projects/tu-proyecto-google/topics/tu-topico-gmail
+GMAIL_KEYWORDS=SINIESTRO,RECLAMO
 
-Si el proyecto del tópico no coincide, la API responde **400** con un mensaje del estilo *Invalid topicName does not match projects/...*.
-
-### 3. Flujo recomendado
-
-```text
-1. GET  /api/v1/gmail/config          → verificar topic y rutas en ESTE proceso
-2. POST /api/v1/gmail/watch/register  → registrar watch (guarda historyId en BD)
-3. POST /api/v1/webhooks/gmail/push   → lo llama Google Pub/Sub (no manual en prod)
-4. POST /api/v1/gmail/scan            → escaneo manual (pruebas sin Pub/Sub)
-5. GET  /api/v1/gmail/correos         → correos guardados
+# Configuración OpenAI e IA
+OPENAI_API_KEY=tu_openai_api_key_aqui
+OPENAI_MODEL=gpt-4
+EMBEDDING_MODEL=text-embedding-3-small
 ```
 
 ---
 
-## Ejecutar el servidor
+## 🚀 Inicio Rápido (Comandos de Ejecución)
 
-Recomendado (evita confusiones con 8001/8002):
+Sigue estos sencillos pasos en tu consola de PowerShell (en Windows):
 
+### 1. Preparar el Entorno Virtual e Instalar Dependencias
 ```powershell
 cd ruta\a\fraude-back
 .\scripts\dev-up.ps1
 ```
 
-Este script usa `.\.venv\Scripts\python.exe` (no busca una carpeta `venv` sin punto).
-
 Este script:
 - libera puertos 8000, 8001 y 8002;
-- aplica `alembic upgrade head`;
 - arranca **solo un** backend en `http://127.0.0.1:8000`;
 - evita tener multiples uvicorn al mismo tiempo.
 
@@ -190,11 +153,12 @@ Alternativa manual:
 ```powershell
 cd ruta\a\fraude-back
 .\.venv\Scripts\Activate.ps1
-uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
+
+# Instalar los paquetes y dependencias del sistema
+pip install -r requirements.txt
 ```
 
-Sin activar venv:
-
+### 2. Ejecutar Migraciones de Base de Datos
 ```powershell
 .\.venv\Scripts\uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
 ```
@@ -214,78 +178,6 @@ Sin activar venv:
 - Los logs se escriben en la **misma terminal** donde corre uvicorn (`INFO`, `ERROR`, tracebacks).
 - Las respuestas de error suelen ser JSON: `{ "detail": "..." }`.
 - Errores de Google API incluyen `"source": "google_api"`.
-
----
-
-## Despliegue en Railway
-
-El repo incluye `Dockerfile` y `railway.toml`. Railway corre el contenedor, aplica migraciones al arrancar y expone la API en un dominio público (`*.up.railway.app`).
-
-### 1. Crear servicio
-
-1. [railway.app](https://railway.app) → **New Project** → **Deploy from GitHub** → repo `fraude-back`.
-2. Railway detecta el `Dockerfile` automáticamente.
-3. **Settings → Networking → Generate Domain** (obtienes algo como `https://fraude-back-production.up.railway.app`).
-
-### 2. Volumen persistente (Gmail token + adjuntos)
-
-Sin volumen, `token.json` y los PDFs se pierden en cada redeploy.
-
-1. **Add Volume** en el servicio.
-2. Monta en `/data`.
-3. Variables:
-
-```env
-GMAIL_TOKEN_FILE=/data/token.json
-GMAIL_DOWNLOAD_DIR=/data/gmail_attachments
-```
-
-### 3. Variables de entorno en Railway
-
-| Variable | Valor |
-|----------|--------|
-| `DATABASE_URL` | Tu Neon (con `?sslmode=require`) |
-| `FRONTEND_URL` | URL de Vercel, ej. `https://tu-app.vercel.app` |
-| `ALLOWED_ORIGINS` | Misma URL del front (varias separadas por coma) |
-| `GMAIL_WATCH_TOPIC` | `projects/fraudia/topics/...` |
-| `OPENAI_API_KEY` | Tu key |
-| `GOOGLE_OAUTH_CREDENTIALS_JSON` | Contenido completo de `credentials.json` (una línea) |
-| `APP_ENV` | `production` |
-
-`APP_BASE_URL` y el redirect OAuth se infieren de `RAILWAY_PUBLIC_DOMAIN` si no los defines. Comprueba con:
-
-```text
-GET https://TU-DOMINIO.up.railway.app/api/v1/gmail/config
-```
-
-### 4. Google Cloud (producción)
-
-En credenciales OAuth **Web**, agrega redirect autorizado:
-
-```text
-https://TU-DOMINIO.up.railway.app/api/v1/gmail/auth/callback
-```
-
-Pub/Sub push (si usas watch en tiempo real):
-
-```text
-https://TU-DOMINIO.up.railway.app/api/v1/webhooks/gmail/push
-```
-
-### 5. Frontend (Vercel)
-
-En el proyecto front:
-
-```env
-NEXT_PUBLIC_API_URL=https://TU-DOMINIO.up.railway.app
-```
-
-### Probar local con Docker (opcional)
-
-```powershell
-docker build -t fraude-back .
-docker run --rm -p 8000:8000 --env-file .env fraude-back
-```
 
 ---
 
@@ -404,120 +296,52 @@ fraude-back/
 
 ## Problemas frecuentes
 
-### `No se encontro .venv` al ejecutar `dev-up.ps1`
-
-Creaste el entorno como `venv` en lugar de `.venv`, o activaste `venv` pero el script espera `.venv`.
-
-**Si ya tienes `venv` con dependencias instaladas** (renombrar, no reinstalar):
-
-```powershell
-deactivate
-Rename-Item -Path venv -NewName .venv
-.\.venv\Scripts\Activate.ps1
-.\scripts\dev-up.ps1
-```
-
-**Si prefieres empezar de cero:**
-
-```powershell
-deactivate
-Remove-Item -Recurse -Force venv -ErrorAction SilentlyContinue
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-.\scripts\dev-up.ps1
-```
-
-No uses `python -m venv venv`; los scripts del repo solo reconocen `.venv`.
-
 ### `Permission denied` al crear `.venv`
 
 El entorno **ya existe**. No ejecutes otra vez `python -m venv .venv`. Usa:
 
 ```powershell
-.\.venv\Scripts\Activate.ps1
+# Levanta el backend estrictamente en http://127.0.0.1:8000
+.\scripts\dev-up.ps1
 ```
 
-Solo recrea `.venv` si lo necesitas: cierra todos los `python.exe`, borra la carpeta `.venv` y vuelve a crearla.
-
-### El API muestra un `GMAIL_WATCH_TOPIC` distinto al de `.env`
-
-Causas habituales:
-
-1. **No guardaste** `.env` (Ctrl+S).
-2. **No reiniciaste** uvicorn tras editar `.env`.
-3. **Varios servidores** en puertos distintos (8000 y 8001) con configs distintas.
-4. Variable de entorno del sistema que **pisa** `.env`.
-
-Solución:
-
+Si deseas iniciarlo de manera manual:
 ```powershell
-# Comprobar qué usa ESTE servidor
-GET http://127.0.0.1:8000/api/v1/gmail/config
-
-# Limpiar variable de sesión si existe
-Remove-Item Env:GMAIL_WATCH_TOPIC -ErrorAction SilentlyContinue
-Remove-Item Env:DATABASE_URL -ErrorAction SilentlyContinue
-
-# Un solo uvicorn
+# Inicio manual con recarga en caliente (Hot Reload)
 uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
 ```
 
-Cerrar procesos en puertos 8000/8001:
+---
 
-```powershell
-Get-NetTCPConnection -LocalPort 8000,8001 -ErrorAction SilentlyContinue |
-  Select-Object -ExpandProperty OwningProcess -Unique |
-  ForEach-Object { Stop-Process -Id $_ -Force -ErrorAction SilentlyContinue }
-```
+## 🔍 Referencia de Endpoints y Documentación Interactiva
 
-### Error 400: topic debe pertenecer al proyecto `fraudia`
+Una vez que el servidor backend esté corriendo, puedes acceder a la documentación interactiva desde tu navegador:
+*   🛡️ **Swagger UI:** [http://127.0.0.1:8000/swagger](http://127.0.0.1:8000/swagger)
+*   🧠 **ReDoc:** [http://127.0.0.1:8000/redoc](http://127.0.0.1:8000/redoc)
 
-`GMAIL_WATCH_TOPIC` usa otro proyecto (p. ej. `fraude-hackiaton`). Debe ser:
+### Principales Endpoints de Integración:
 
-```env
-GMAIL_WATCH_TOPIC=projects/<project_id_de_credentials>/topics/<nombre>
-```
-
-### Error de base de datos
-
-- Revisa `DATABASE_URL` (host, puerto, usuario, contraseña).
-- Neon requiere `?sslmode=require`.
-- No uses el puerto **5433** de Docker antiguo; en local suele ser **5432**.
-
-### Swagger en 404
-
-Usa **`/swagger`**, no `/docs`.
-
-### Puerto ocupado
-
-```powershell
-uvicorn app.main:app --reload --host 127.0.0.1 --port 8001
-```
-
-Y actualiza la URL en Bruno al mismo puerto.
+| Módulo | Tipo | Endpoint | Descripción |
+| :--- | :--- | :--- | :--- |
+| **Siniestros** | `GET` | `/api/v1/siniestros` | Lista todos los siniestros con paginación. |
+| **Siniestros** | `POST` | `/api/v1/siniestros/{id}/score/ai` | Evalúa reglas de fraude + análisis cognitivo OpenAI. |
+| **Gmail** | `POST` | `/api/v1/gmail/scan` | Escanea manualmente la bandeja de entrada de Gmail. |
+| **Webhooks** | `POST` | `/api/v1/webhooks/gmail/push` | Recibe la notificación Push de Google Pub/Sub. |
+| **Copiloto RAG** | `POST` | `/api/v1/chat/index` | Indexa los nuevos siniestros a la base vectorial. |
+| **Copiloto RAG** | `POST` | `/api/v1/chat/query` | Realiza consultas en lenguaje natural al Copiloto AI. |
 
 ---
 
-## Desarrollo
+## 🛠️ Diagnóstico y Resolución de Problemas (FAQ)
 
-| Acción | Cómo |
-|--------|------|
-| Recarga de código | `uvicorn --reload` |
-| Ver SQL | `SQLALCHEMY_ECHO=true` en `.env` |
-| Nueva migración | `alembic revision --autogenerate -m "..."` |
-| Ejecutar desde | Raíz del repo (donde está `app/`) |
+> [!WARNING]
+> **Error de Sintaxis al levantar Uvicorn:**
+> Si al levantar el servidor ves errores del tipo `SyntaxError: '(' was never closed` o similar, asegúrate de no tener bloques duplicados en el código. *Este backend ha sido saneado de raíz y ya no posee errores de compilación.*
 
----
+> [!IMPORTANT]
+> **Error `AttributeError: 'GmailIngestionService' object has no attribute '_send_auto_reply_template'`:**
+> Este error ocurre cuando la firma del método de auto-respuesta se borra de `service.py`. En la versión actual este problema está **100% corregido** y restaurado con una estructura limpia.
 
-## Resumen de comandos
-
-```powershell
-.\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-copy .env.example .env
-alembic upgrade head
-uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
-```
-
-Swagger: **http://127.0.0.1:8000/swagger**
+> [!CAUTION]
+> **Fallo de lectura de adjunto TXT en Reprocesamiento (`invalid pdf header`):**
+> Si subes o respondes con una plantilla `.txt`, la función de reprocesamiento histórico solía asumir erróneamente que todos los adjuntos eran PDFs. Hemos modificado la función `reprocess_correo_pdfs` para que valide la extensión `.txt` y la procese de forma inmediata como texto plano, ahorrando tiempo y eliminando la advertencia de error.

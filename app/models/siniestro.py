@@ -35,6 +35,10 @@ class Siniestro(Base):
     scoring_audited_at = Column(DateTime(timezone=True), nullable=True)
     correo = relationship("GmailCorreo", back_populates="siniestros")
 
+    @property
+    def remitente_correo(self) -> str | None:
+        return self.correo.remitente if self.correo else None
+
     __table_args__ = (
         Index("ix_siniestros_gmail_correo_id", "gmail_correo_id"),
         Index("ix_siniestros_id_poliza", "id_poliza"),

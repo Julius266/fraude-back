@@ -806,12 +806,9 @@ class GmailIngestionService:
             f"        auditoría y agilizar el procesamiento ético de su caso, requerimos que nos devuelva la información del siniestro estructurada."
             f"      </p>"
             f"      <p style='font-size: 12.5px; line-height: 1.6; color: #475569;'>"
-            f"        Por favor, <strong>responda a este correo electrónico</strong> o envíenos un documento PDF adjunto "
-            f"        <strong>completando exactamente la siguiente plantilla</strong> sin modificar los títulos de los campos:"
+            f"        Por favor, <strong>descargue el formato de plantilla oficial adjunto a este correo electrónico</strong>, rellene todos los campos estructurados "
+            f"        y <strong>responda directamente a este correo</strong> adjuntando el documento completado."
             f"      </p>"
-            f"      <div style='background-color: #f8fafc; border: 1px solid #e2e8f0; padding: 15px; border-radius: 6px; margin: 20px 0; font-family: monospace; font-size: 11px; white-space: pre-wrap; color: #334155; max-height: 300px; overflow-y: auto;'>"
-            f"{template_text}"
-            f"      </div>"
             f"      <div style='background-color: #f0fdf4; border-left: 4px solid #16a34a; padding: 12px; border-radius: 4px; margin: 20px 0;'>"
             f"        <strong style='font-size: 11px; color: #15803d; text-transform: uppercase; display: block;'>Requisito Indispensable:</strong>"
             f"        <p style='margin: 3px 0 0 0; font-size: 11px; color: #166534;'>"
@@ -820,7 +817,7 @@ class GmailIngestionService:
             f"      </div>"
             f"      <p style='font-size: 11px; color: #64748b; text-align: center; border-top: 1px solid #e2e8f0; padding-top: 15px; margin-top: 25px;'>"
             f"        Este es un correo automático generado por el motor de triaje virtual de Aseguradora del Sur.<br/>"
-            f"        No modifique los nombres de los campos de la plantilla para asegurar su procesamiento inmediato."
+            f"        Complete los campos del documento adjunto sin modificar los títulos para asegurar su procesamiento inmediato."
             f"      </p>"
             f"    </div>"
             f"  </div>"
@@ -883,7 +880,7 @@ class GmailIngestionService:
         self.client.send_email(
             to=correo.remitente,
             subject=subject,
-            body_text=f"Estimado cliente,\n\n{body_text_intro}\n\n{template_text}",
+            body_text=f"Estimado cliente,\n\n{body_text_intro}",
             html_body=html_body,
             thread_id=correo.gmail_message_id,
             attachments=attachments,
