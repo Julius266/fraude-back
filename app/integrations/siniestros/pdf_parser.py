@@ -382,9 +382,9 @@ class SiniestroPdfParser:
         value = self._extract_value_from_money_labels(text, labels)
         if not value:
             return Decimal("0")
-        normalized = value.replace("$", "").replace(".", "").replace(",", ".")
+        # _compact already removed $ and commas; the period is the decimal separator
         try:
-            return Decimal(normalized)
+            return Decimal(value)
         except InvalidOperation:
             logger.warning("No se pudo convertir monto value=%s", value)
             return Decimal("0")
