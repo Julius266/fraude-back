@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from app.integrations.chat.vector_search import SearchHit
 from app.integrations.siniestros.scoring import FraudScoringService, ScoreComputation, ScoringContext
-from app.schemas.scoring import ScoringRuleResult, ScoringSignals
+from app.schemas.scoring import ScoringBreakdownItem, ScoringRuleResult, ScoringSignals
 
 
 def _signals_from_payload(payload: dict | None) -> ScoringSignals:
@@ -28,6 +28,44 @@ def _context_from_payload(payload: dict | None) -> ScoringContext:
         max_narrative_similarity=float(ctx.get("max_narrative_similarity", 0.0)),
         frecuencia_vehiculo=int(ctx.get("frecuencia_vehiculo", 0)),
         frecuencia_rc_previo=int(ctx.get("frecuencia_rc_previo", 0)),
+    )
+
+
+def score_from_persisted_payload(payload: dict | None) -> ScoreComputation | None:
+    """Devuelve el scoring persistido por audit_and_persist sin recalcular reglas."""
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("total_score") is None:
+        return None
+
+    rules: list[ScoringRuleResult] = []
+    for rule in payload.get("rules") or []:
+        if isinstance(rule, dict):
+            try:
+                rules.append(ScoringRuleResult(**rule))
+            except Exception:
+                continue
+
+    breakdown: list[ScoringBreakdownItem] = []
+    for item in payload.get("breakdown") or []:
+        if isinstance(item, dict):
+            try:
+                breakdown.append(ScoringBreakdownItem(**item))
+            except Exception:
+                continue
+
+    total = int(payload.get("total_score", 0) or 0)
+    average = float(payload.get("average_points", 0) or 0)
+    color = str(payload.get("score_color") or resolve_score_color_from_total(total))
+    band = str(payload.get("score_band") or resolve_score_band_from_total(total))
+
+    return ScoreComputation(
+        total_score=total,
+        average_points=average,
+        score_color=color,
+        score_band=band,
+        rules=rules,
+        breakdown=breakdown,
     )
 
 
@@ -57,6 +95,11 @@ def official_score_for_siniestro(
     """
     service = scoring_service or FraudScoringService()
     payload = getattr(siniestro, "scoring_payload", None)
+
+    if isinstance(payload, dict):
+        persisted = score_from_persisted_payload(payload)
+        if persisted is not None and payload.get("signals"):
+            return persisted
 
     if not isinstance(payload, dict):
         return service.calculate(siniestro, ScoringSignals())

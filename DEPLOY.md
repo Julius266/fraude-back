@@ -233,6 +233,19 @@ docker run --rm -p 8000:8000 --env-file .env fraude-back
 
 ---
 
+## Multi-usuario (aislamiento de cuentas)
+
+Cada analista tiene su **propio token OAuth** en PostgreSQL (`gmail_oauth_tokens`), keyed por email.
+
+- Conectar Gmail en un navegador **no** afecta la sesión de otro usuario.
+- `/api/v1/gmail/auth/status` solo responde `connected: true` para el email del header `X-Analyst-Email`.
+- Logout solo borra el token del usuario que cierra sesión.
+- Los siniestros/correos ya se filtran por `owner_email` en BD.
+
+El `token.json` legacy en disco se migra automáticamente a BD al arrancar (una sola vez).
+
+---
+
 ## Archivos de despliegue
 
 | Archivo | Uso |

@@ -38,7 +38,11 @@ class GmailIngestionService:
     @property
     def client(self) -> GmailClient:
         if self._client is None:
-            self._client = GmailClient()
+            if not self.owner_email:
+                raise GmailNotAuthenticatedError(
+                    "No hay analista asociado. Inicia sesión con Gmail."
+                )
+            self._client = GmailClient(owner_email=self.owner_email)
         return self._client
 
     @staticmethod
@@ -620,7 +624,9 @@ class GmailIngestionService:
             if siniestro.id_siniestro in seen:
                 continue
             seen.add(siniestro.id_siniestro)
-            if siniestro.scoring_payload is not None:
+            if siniestro.scoring_payload is not None and not AutoScoringService.payload_needs_reaudit(
+                siniestro.scoring_payload
+            ):
                 continue
             try:
                 self.db.refresh(siniestro)

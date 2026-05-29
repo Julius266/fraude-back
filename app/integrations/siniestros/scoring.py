@@ -23,7 +23,7 @@ class ScoreComputation:
 
 
 class FraudScoringService:
-    VERSION = "fraud-rules-v2"
+    VERSION = "fraud-rules-v2.1"
 
     SCORE_BAND_ALTO = 50
     SCORE_BAND_MEDIO = 25
@@ -203,13 +203,24 @@ class FraudScoringService:
         reclamado = float(siniestro.monto_reclamado or 0)
         if estimado <= 0:
             return self._rule("RS-14", "Monto cercano o superior a suma asegurada", "Amarillo",
-                              False, 0, "Sin monto estimado disponible para calcular proporción.")
+                              False, 0, "Sin monto estimado/reserva disponible para calcular proporción.")
+        # Reserva operativa igual al reclamo es habitual en expedientes; no es alerta por sí sola.
+        if abs(reclamado - estimado) < max(estimado * 0.01, 1.0):
+            return self._rule("RS-14", "Monto cercano o superior a suma asegurada", "Amarillo",
+                              False, 0,
+                              "Monto reclamado coincide con la reserva/estimado (operación normal).")
+        if reclamado > estimado:
+            return self._rule("RS-14", "Monto cercano o superior a suma asegurada", "Amarillo",
+                              True, 4,
+                              f"Monto reclamado (${reclamado:,.0f}) supera la reserva/estimado (${estimado:,.0f}).")
         ratio = reclamado / estimado
-        matched = ratio >= 0.95 or reclamado >= estimado * 1.5
+        if ratio >= 0.95:
+            return self._rule("RS-14", "Monto cercano o superior a suma asegurada", "Amarillo",
+                              True, 4,
+                              f"Monto reclamado representa el {ratio:.0%} de la reserva/estimado (≥ 95%).")
         return self._rule("RS-14", "Monto cercano o superior a suma asegurada", "Amarillo",
-                          matched, 4 if matched else 0,
-                          f"Monto reclamado representa el {ratio:.0%} del estimado." if matched
-                          else f"Monto reclamado ({ratio:.0%} del estimado) dentro de rango normal.")
+                          False, 0,
+                          f"Monto reclamado ({ratio:.0%} de la reserva) dentro de rango normal.")
 
     # ── helpers ───────────────────────────────────────────────────────────────
     @staticmethod

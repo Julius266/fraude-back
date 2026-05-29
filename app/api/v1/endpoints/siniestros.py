@@ -8,8 +8,14 @@ from app.db.session import get_db
 from app.integrations.chat.index_service import EmbeddingIndexService
 from app.integrations.siniestros.auto_scoring import AutoScoringService
 from app.integrations.siniestros.email_template import build_confirmation_email
-from app.integrations.siniestros.scoring import FraudScoringService
-from app.integrations.chat.context_builder import official_score_for_siniestro
+from app.integrations.siniestros.scoring import FraudScoringService, ScoreComputation, ScoringContext
+from app.integrations.chat.context_builder import (
+    _context_from_payload,
+    _signals_from_payload,
+    score_from_persisted_payload,
+)
+from app.integrations.siniestros.scoring_context import compute_scoring_context
+from app.schemas.scoring import ScoringSignals
 from app.models.siniestro import Siniestro
 from app.schemas.scoring import (
     SiniestroAIScoringRequest,
@@ -32,12 +38,27 @@ router = APIRouter(prefix="/siniestros", tags=["Siniestros"])
 scoring_service = FraudScoringService()
 
 
-def _enrich_with_score(siniestro: Siniestro) -> SiniestroWithScoreRead:
+def _preview_score(siniestro: Siniestro, db: Session | None) -> ScoreComputation:
+    """Scoring determinístico sin IA: contexto BD + señales vacías."""
+    context = compute_scoring_context(db, siniestro) if db is not None else ScoringContext()
+    return scoring_service.calculate(siniestro, ScoringSignals(), context)
+
+
+def _enrich_with_score(siniestro: Siniestro, db: Session | None = None) -> SiniestroWithScoreRead:
     base = SiniestroRead.model_validate(siniestro)
 
     if siniestro.scoring_payload:
         payload = siniestro.scoring_payload
-        result = official_score_for_siniestro(siniestro, scoring_service)
+        if AutoScoringService.payload_needs_reaudit(payload):
+            signals = _signals_from_payload(payload)
+            context = compute_scoring_context(db, siniestro) if db is not None else _context_from_payload(payload)
+            result = scoring_service.calculate(siniestro, signals, context)
+        else:
+            result = score_from_persisted_payload(payload)
+            if result is None:
+                signals = _signals_from_payload(payload)
+                context = _context_from_payload(payload)
+                result = scoring_service.calculate(siniestro, signals, context)
         matched = [rule.code for rule in result.rules if rule.matched]
         return SiniestroWithScoreRead(
             **base.model_dump(),
@@ -54,21 +75,26 @@ def _enrich_with_score(siniestro: Siniestro) -> SiniestroWithScoreRead:
             scoring_audited_at=siniestro.scoring_audited_at,
         )
 
-    result = scoring_service.calculate(siniestro, SiniestroScoringRequest().signals)
+    result = _preview_score(siniestro, db)
+    matched = [rule.code for rule in result.rules if rule.matched]
     return SiniestroWithScoreRead(
         **base.model_dump(),
         total_score=result.total_score,
         average_points=result.average_points,
         score_color=result.score_color,
         score_band=result.score_band,
+        rules=result.rules,
+        breakdown=result.breakdown,
+        matched_rules=matched,
     )
 
 
-def _score_color_for_summary(siniestro: Siniestro) -> str:
+def _score_color_for_summary(siniestro: Siniestro, db: Session | None = None) -> str:
     if siniestro.scoring_payload:
-        return official_score_for_siniestro(siniestro, scoring_service).score_color
-    result = scoring_service.calculate(siniestro, SiniestroScoringRequest().signals)
-    return result.score_color
+        persisted = score_from_persisted_payload(siniestro.scoring_payload)
+        if persisted is not None:
+            return persisted.score_color
+    return _preview_score(siniestro, db).score_color
 
 
 def _find_siniestro(db: Session, id_siniestro: str, owner_email: str | None = None) -> Siniestro | None:
@@ -103,7 +129,7 @@ def siniestros_summary(
     by_ramo: dict[str, int] = {}
 
     for siniestro in siniestros:
-        score_color = _score_color_for_summary(siniestro)
+        score_color = _score_color_for_summary(siniestro, db)
         by_color[score_color] = by_color.get(score_color, 0) + 1
         by_ramo[siniestro.ramo] = by_ramo.get(siniestro.ramo, 0) + 1
 
@@ -130,7 +156,35 @@ def list_siniestros(
         .limit(limit)
     )
     siniestros = list(db.scalars(statement).all())
-    return [_enrich_with_score(s) for s in siniestros]
+    return [_enrich_with_score(s, db) for s in siniestros]
+
+
+@router.post("/reaudit-stale")
+def reaudit_stale_siniestros(
+    limit: int = Query(default=30, ge=1, le=100),
+    db: Session = Depends(get_db),
+    owner_email: str = Depends(get_analyst_email),
+) -> dict[str, object]:
+    """Re-ejecuta auditoría IA en siniestros con scoring desactualizado (p. ej. tras cambio de reglas)."""
+    service = AutoScoringService(db)
+    rows = list(db.scalars(siniestro_scope(owner_email)).all())
+    audits: list[dict[str, object]] = []
+
+    for siniestro in rows:
+        if len(audits) >= limit:
+            break
+        if not AutoScoringService.payload_needs_reaudit(siniestro.scoring_payload):
+            continue
+        try:
+            response = service.audit_and_persist(siniestro)
+            audits.append(AutoScoringService.to_audit_summary(response))
+        except Exception as exc:
+            audits.append({
+                "id_siniestro": siniestro.id_siniestro,
+                "error": str(exc),
+            })
+
+    return {"reaudited": len(audits), "audits": audits}
 
 
 @router.post("", response_model=SiniestroWithScoreRead, status_code=201)
@@ -167,7 +221,7 @@ def create_siniestro(
         pass
 
     db.refresh(siniestro)
-    return _enrich_with_score(siniestro)
+    return _enrich_with_score(siniestro, db)
 
 
 def _send_email_for_siniestro(db: Session, id_siniestro: str, owner_email: str) -> SendEmailResponse:
@@ -196,7 +250,7 @@ def get_siniestro(
     siniestro = _find_siniestro(db, id_siniestro, owner_email=owner_email)
     if not siniestro:
         raise HTTPException(status_code=404, detail=f"Siniestro no encontrado: {id_siniestro}")
-    return _enrich_with_score(siniestro)
+    return _enrich_with_score(siniestro, db)
 
 
 @router.post("/{id_siniestro}/send-email", response_model=SendEmailResponse)
@@ -221,7 +275,14 @@ def score_siniestro(
     if not siniestro:
         raise HTTPException(status_code=404, detail=f"Siniestro no encontrado: {id_siniestro}")
 
-    result = scoring_service.calculate(siniestro, payload.signals)
+    context = compute_scoring_context(db, siniestro)
+    signals = payload.signals
+    if siniestro.scoring_payload and not any(
+        getattr(signals, field) for field in ScoringSignals.model_fields
+    ):
+        signals = _signals_from_payload(siniestro.scoring_payload)
+
+    result = scoring_service.calculate(siniestro, signals, context)
     matched = [rule.code for rule in result.rules if rule.matched]
 
     return SiniestroScoringResponse(
@@ -277,7 +338,7 @@ def update_siniestro_status(
     except Exception:
         pass
 
-    return _enrich_with_score(siniestro)
+    return _enrich_with_score(siniestro, db)
 
 
 @router.post("/send-custom-email", response_model=SendEmailResponse)
@@ -298,10 +359,10 @@ def send_custom_siniestro_email(
     # 2. Cargar credenciales y cliente de Gmail
     try:
         settings = get_settings()
-        creds = load_valid_credentials()
+        creds = load_valid_credentials(owner_email)
         if not creds:
             raise HTTPException(status_code=401, detail="No se encontraron credenciales de Gmail válidas.")
-        client = GmailClient(creds)
+        client = GmailClient(owner_email=owner_email, credentials=creds)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error al cargar el cliente de Gmail: {str(e)}")
 

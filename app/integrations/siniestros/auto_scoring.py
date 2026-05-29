@@ -1,14 +1,14 @@
 from __future__ import annotations
 
 import logging
-from datetime import date, timedelta
-from difflib import SequenceMatcher
+import re
+from datetime import datetime, timezone
 
-from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from app.integrations.siniestros.ai_scoring import AIScoringService
 from app.integrations.siniestros.scoring import FraudScoringService, ScoringContext
+from app.integrations.siniestros.scoring_context import compute_scoring_context
 from app.models.siniestro import Siniestro
 from app.schemas.scoring import (
     ScoringAiExplanation,
@@ -20,10 +20,19 @@ from app.schemas.scoring import (
 
 logger = logging.getLogger(__name__)
 
-_18_MONTHS = timedelta(days=548)
+_ROBO_KEYWORDS = (
+    "robo", "hurto", "sustraccion", "sustracción", "apropiacion", "apropiación",
+    "ptxrb", "perdida total por robo", "pérdida total por robo",
+)
+_MADRUGADA_PATTERN = re.compile(r"\b(0[0-4]|00)\s*:\s*\d{2}\b|madrugada|medianoche")
+_COLISION_KEYWORDS = ("colision", "colisión", "choque", "impacto", "accidente")
+_FUGA_KEYWORDS = ("fuga", "huyo", "huyó", "no dejo", "no dejó", "sin placa", "tercero desconocido")
+_SEVERO_KEYWORDS = ("perdida total", "pérdida total", "inutilizacion", "inutilización", "severo", "destroz")
 
 
 class AutoScoringService:
+    VERSION = FraudScoringService.VERSION
+
     def __init__(self, db: Session):
         self.db = db
         self.rules_service = FraudScoringService()
@@ -33,7 +42,6 @@ class AutoScoringService:
         siniestro: Siniestro,
         manual_signals: ScoringSignals | None = None,
     ) -> SiniestroAIScoringResponse:
-        from datetime import datetime, timezone
         response = self.build_ai_response(siniestro, manual_signals=manual_signals)
         siniestro.scoring_payload = response.model_dump(mode="json")
         siniestro.scoring_audited_at = datetime.now(timezone.utc)
@@ -50,28 +58,34 @@ class AutoScoringService:
         siniestro: Siniestro,
         manual_signals: ScoringSignals | None = None,
     ) -> SiniestroAIScoringResponse:
-        # 1. Métricas determinísticas que requieren BD
         context = self._compute_context(siniestro)
+        heuristic = self._heuristic_signals(siniestro, context)
 
-        # 2. Señales semánticas via IA
         ai_explanation: ScoringAiExplanation | None = None
         ai_signals: ScoringSignals | None = None
         try:
-            ai_result = AIScoringService(self.db).analyze(siniestro)
+            ai_result = AIScoringService(self.db).analyze(siniestro, context=context)
             ai_signals = ai_result.signals
             ai_explanation = ai_result.explanation
         except Exception as exc:
             logger.warning("IA no disponible para id=%s: %s", siniestro.id_siniestro, exc)
             ai_explanation = ScoringAiExplanation(
-                model="fallback-no-ai",
-                summary=f"IA no disponible. Fallback determinístico aplicado. Detalle: {exc}",
+                model="fallback-heuristic",
+                summary=(
+                    f"IA no disponible; se aplicaron señales heurísticas determinísticas. "
+                    f"Detalle: {exc}"
+                ),
                 tools_called=[],
                 signal_rationale={},
             )
 
-        selected_signals = manual_signals or ai_signals or SiniestroScoringRequest().signals
+        if manual_signals is not None:
+            selected_signals = manual_signals
+        elif ai_signals is not None:
+            selected_signals = self._merge_signals(ai_signals, heuristic)
+        else:
+            selected_signals = heuristic
 
-        # 3. Motor de reglas con contexto de BD + señales de IA
         result = self.rules_service.calculate(siniestro, selected_signals, context)
         matched = [r.code for r in result.rules if r.matched]
 
@@ -95,54 +109,44 @@ class AutoScoringService:
         )
 
     def _compute_context(self, siniestro: Siniestro) -> ScoringContext:
-        """Consultas a BD para las métricas determinísticas que no vienen en el modelo."""
-        cutoff = date.today() - _18_MONTHS
+        return compute_scoring_context(self.db, siniestro)
 
-        # Similitud narrativa máxima contra los últimos 50 siniestros
-        recent = self.db.scalars(
-            select(Siniestro)
-            .where(Siniestro.id_siniestro != siniestro.id_siniestro)
-            .order_by(Siniestro.fecha_reporte.desc())
-            .limit(50)
-        ).all()
-        similarities = [
-            SequenceMatcher(
-                a=siniestro.descripcion.lower(),
-                b=row.descripcion.lower(),
-            ).ratio()
-            for row in recent
-        ]
-        max_sim = max(similarities, default=0.0)
+    @staticmethod
+    def _heuristic_signals(siniestro: Siniestro, context: ScoringContext) -> ScoringSignals:
+        cobertura = (siniestro.cobertura or "").lower()
+        descripcion = (siniestro.descripcion or "").lower()
 
-        # Frecuencia de siniestros del mismo vehículo/póliza en 18 meses
-        freq_vehiculo = int(self.db.scalar(
-            select(func.count()).select_from(Siniestro)
-            .where(
-                Siniestro.id_poliza == siniestro.id_poliza,
-                Siniestro.id_siniestro != siniestro.id_siniestro,
-                Siniestro.fecha_ocurrencia >= cutoff,
-            )
-        ) or 0)
+        cobertura_robo = any(kw in cobertura for kw in _ROBO_KEYWORDS)
+        madrugada = bool(_MADRUGADA_PATTERN.search(descripcion))
+        colision = any(kw in descripcion for kw in _COLISION_KEYWORDS)
+        sin_tercero = any(kw in descripcion for kw in _FUGA_KEYWORDS) and any(
+            kw in descripcion for kw in _SEVERO_KEYWORDS
+        )
 
-        # Frecuencia de siniestros solo RC del mismo asegurado en 18 meses
-        freq_rc = int(self.db.scalar(
-            select(func.count()).select_from(Siniestro)
-            .where(
-                Siniestro.id_asegurado == siniestro.id_asegurado,
-                Siniestro.id_siniestro != siniestro.id_siniestro,
-                Siniestro.fecha_ocurrencia >= cutoff,
-                or_(
-                    Siniestro.cobertura.ilike("%responsabilidad%"),
-                    Siniestro.cobertura.ilike("% rc%"),
-                    Siniestro.cobertura.ilike("rc %"),
-                ),
-            )
-        ) or 0)
+        docs_inconsistentes = False
+        if not siniestro.documentos_completos and any(
+            kw in descripcion for kw in ("fecha anterior", "alterad", "ilegible", "contradict")
+        ):
+            docs_inconsistentes = True
 
-        return ScoringContext(
-            max_narrative_similarity=max_sim,
-            frecuencia_vehiculo=freq_vehiculo,
-            frecuencia_rc_previo=freq_rc,
+        return ScoringSignals(
+            cobertura_involucra_robo=cobertura_robo,
+            documentos_inconsistentes=docs_inconsistentes,
+            dinamica_accidente_madrugada=madrugada and colision,
+            sin_tercero_identificado=sin_tercero,
+        )
+
+    @staticmethod
+    def _merge_signals(ai: ScoringSignals, heuristic: ScoringSignals) -> ScoringSignals:
+        """La IA manda; las heurísticas solo rellenan señales obvias que el modelo omitió."""
+        return ScoringSignals(
+            cobertura_involucra_robo=ai.cobertura_involucra_robo or heuristic.cobertura_involucra_robo,
+            proveedor_en_lista_restrictiva=ai.proveedor_en_lista_restrictiva,
+            proveedor_recurrente_observado=ai.proveedor_recurrente_observado,
+            documentos_inconsistentes=ai.documentos_inconsistentes or heuristic.documentos_inconsistentes,
+            dinamica_relato_ilogico=ai.dinamica_relato_ilogico,
+            dinamica_accidente_madrugada=ai.dinamica_accidente_madrugada or heuristic.dinamica_accidente_madrugada,
+            sin_tercero_identificado=ai.sin_tercero_identificado or heuristic.sin_tercero_identificado,
         )
 
     @staticmethod
@@ -155,3 +159,9 @@ class AutoScoringService:
             "score_band": response.score_band,
             "summary": summary,
         }
+
+    @staticmethod
+    def payload_needs_reaudit(payload: dict | None) -> bool:
+        if not isinstance(payload, dict):
+            return True
+        return payload.get("version") != FraudScoringService.VERSION

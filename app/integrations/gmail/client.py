@@ -18,8 +18,8 @@ logger = logging.getLogger(__name__)
 
 
 class GmailClient:
-    def __init__(self, credentials: Credentials | None = None) -> None:
-        creds = credentials or load_valid_credentials()
+    def __init__(self, owner_email: str | None = None, credentials: Credentials | None = None) -> None:
+        creds = credentials or load_valid_credentials(owner_email)
         if creds is None:
             raise GmailNotAuthenticatedError(
                 "No hay sesión OAuth de Gmail. Conecta tu cuenta desde el login."

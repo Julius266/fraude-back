@@ -7,7 +7,7 @@ from fastapi.responses import RedirectResponse
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.api.deps import get_analyst_email, get_gmail_owner_email
+from app.api.deps import get_analyst_email, get_gmail_owner_email, get_optional_analyst_email
 from app.core.config import get_settings
 from app.db.session import SessionLocal, get_db
 from app.integrations.gmail.oauth import (
@@ -76,8 +76,10 @@ def gmail_config() -> dict[str, str]:
 
 
 @router.get("/auth/status", response_model=GmailAuthStatus)
-def gmail_auth_status() -> GmailAuthStatus:
-    status = get_auth_status()
+def gmail_auth_status(
+    owner_email: str | None = Depends(get_optional_analyst_email),
+) -> GmailAuthStatus:
+    status = get_auth_status(owner_email=owner_email)
     user = GmailScanUser(**status["user"]) if status.get("user") else None
     return GmailAuthStatus(
         credentials_configured=status["credentials_configured"],
@@ -117,9 +119,12 @@ def gmail_auth_callback(
         return RedirectResponse(url=f"{frontend}/login?gmail=error&message=missing_code")
 
     try:
-        return_to = exchange_authorization_code(code, state)
+        return_to, connected_email = exchange_authorization_code(code, state)
         safe_return = quote(return_to if return_to.startswith("/") else "/")
-        return RedirectResponse(url=f"{frontend}/login?gmail=connected&returnTo={safe_return}")
+        safe_email = quote(connected_email)
+        return RedirectResponse(
+            url=f"{frontend}/login?gmail=connected&returnTo={safe_return}&email={safe_email}"
+        )
     except Exception as exc:
         logger.exception("Callback OAuth de Gmail falló")
         message = quote(str(exc))
@@ -127,15 +132,18 @@ def gmail_auth_callback(
 
 
 @router.post("/auth/logout")
-def gmail_auth_logout() -> dict[str, str]:
-    clear_credentials()
-    return {"status": "token_cleared"}
+def gmail_auth_logout(owner_email: str = Depends(get_analyst_email)) -> dict[str, str]:
+    clear_credentials(owner_email)
+    return {"status": "token_cleared", "owner_email": owner_email}
 
 
 @router.post("/watch/register")
-def register_watch(db: Session = Depends(get_db)) -> dict[str, object]:
+def register_watch(
+    db: Session = Depends(get_db),
+    owner_email: str = Depends(get_gmail_owner_email),
+) -> dict[str, object]:
     try:
-        service = GmailIngestionService(db)
+        service = GmailIngestionService(db, owner_email=owner_email)
         result = service.register_watch()
     except GmailNotAuthenticatedError as exc:
         raise HTTPException(status_code=401, detail=str(exc)) from exc

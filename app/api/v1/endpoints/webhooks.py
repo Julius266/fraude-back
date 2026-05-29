@@ -33,8 +33,16 @@ async def gmail_push_webhook(request: Request, db: Session = Depends(get_db)) ->
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Missing Pub/Sub message data")
 
     decoded_payload = json.loads(base64.b64decode(data).decode("utf-8"))
-    logger.info("Pub/Sub payload decodificado historyId=%s emailAddress=%s", decoded_payload.get("historyId"), decoded_payload.get("emailAddress"))
-    service = GmailIngestionService(db)
+    owner_email = str(decoded_payload.get("emailAddress", "") or "").strip().lower()
+    logger.info(
+        "Pub/Sub payload decodificado historyId=%s emailAddress=%s",
+        decoded_payload.get("historyId"),
+        owner_email or decoded_payload.get("emailAddress"),
+    )
+    if not owner_email:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Missing emailAddress in Pub/Sub payload")
+
+    service = GmailIngestionService(db, owner_email=owner_email)
     try:
         result = service.process_push_notification(decoded_payload)
     except Exception:

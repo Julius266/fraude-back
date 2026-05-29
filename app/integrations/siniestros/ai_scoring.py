@@ -3,15 +3,19 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass
-from difflib import SequenceMatcher
 from typing import Any
 
-from openai import OpenAI
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
 from app.integrations.siniestros.fraud_rules_context import build_fraud_rules_prompt_section
+from app.integrations.siniestros.scoring import ScoringContext
+from app.integrations.siniestros.scoring_context import (
+    base_siniestro_id,
+    compute_scoring_context,
+    narrative_similarity,
+)
 from app.models.gmail_correo import GmailCorreo
 from app.models.siniestro import Siniestro
 from app.schemas.scoring import ScoringAiExplanation, ScoringSignals
@@ -104,9 +108,11 @@ class AIScoringService:
         self.settings = get_settings()
         self.client = OpenAI(api_key=self.settings.openai_api_key)
 
-    def analyze(self, siniestro: Siniestro) -> AIScoringResult:
+    def analyze(self, siniestro: Siniestro, context: ScoringContext | None = None) -> AIScoringResult:
         if not self.settings.openai_api_key:
             raise ValueError("OPENAI_API_KEY no está configurada")
+
+        ctx = context or compute_scoring_context(self.db, siniestro)
 
         base_context = {
             "siniestro": {
@@ -126,7 +132,16 @@ class AIScoringService:
                 "dias_desde_fin_poliza": siniestro.dias_desde_fin_poliza,
                 "dias_entre_ocurrencia_reporte": siniestro.dias_entre_ocurrencia_reporte,
                 "historial_siniestros_asegurado": siniestro.historial_siniestros_asegurado,
-            }
+            },
+            "metricas_precalculadas": {
+                "max_narrative_similarity": round(ctx.max_narrative_similarity, 4),
+                "frecuencia_vehiculo_18m": ctx.frecuencia_vehiculo,
+                "frecuencia_rc_previo_18m": ctx.frecuencia_rc_previo,
+                "nota": (
+                    "Estas métricas ya excluyen variantes del mismo id base. "
+                    "Úsalas para calibrar señales; confirma con herramientas si hay duda."
+                ),
+            },
         }
 
         messages: list[dict[str, Any]] = [
@@ -134,8 +149,8 @@ class AIScoringService:
             {
                 "role": "user",
                 "content": (
-                    "Analiza este expediente. Llama las herramientas que necesites para obtener "
-                    "evidencia adicional y luego decide las señales.\n"
+                    "Analiza este expediente. Debes llamar al menos "
+                    "detect_narrative_similarity y get_claim_history antes de decidir señales.\n"
                     + json.dumps(base_context, ensure_ascii=True)
                 ),
             },
@@ -306,18 +321,27 @@ class AIScoringService:
         return {"has_email": True, "subject": correo.asunto, "from": correo.remitente, "documents": docs}
 
     def _detect_narrative_similarity(self, siniestro: Siniestro, threshold: float) -> dict[str, Any]:
-        rows = self.db.scalars(
-            select(Siniestro)
-            .where(Siniestro.id_siniestro != siniestro.id_siniestro)
-            .order_by(Siniestro.fecha_reporte.desc())
-            .limit(50)
-        ).all()
+        current_base = base_siniestro_id(siniestro.id_siniestro)
+        owner = (siniestro.owner_email or "").strip().lower() or None
+
+        query = select(Siniestro).where(Siniestro.id_siniestro != siniestro.id_siniestro)
+        if owner:
+            query = query.where(
+                or_(Siniestro.owner_email == owner, Siniestro.owner_email.is_(None))
+            )
+
+        rows = self.db.scalars(query.order_by(Siniestro.fecha_reporte.desc()).limit(80)).all()
         hits = []
         for row in rows:
-            ratio = SequenceMatcher(a=siniestro.descripcion.lower(), b=row.descripcion.lower()).ratio()
+            if base_siniestro_id(row.id_siniestro) == current_base:
+                continue
+            ratio = narrative_similarity(siniestro.descripcion, row.descripcion)
             if ratio >= threshold:
-                hits.append({"id_siniestro": row.id_siniestro, "similarity": round(ratio, 4),
-                              "descripcion_preview": row.descripcion[:200]})
+                hits.append({
+                    "id_siniestro": row.id_siniestro,
+                    "similarity": round(ratio, 4),
+                    "descripcion_preview": row.descripcion[:200],
+                })
         hits.sort(key=lambda x: x["similarity"], reverse=True)
         return {
             "threshold": threshold,

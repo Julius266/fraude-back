@@ -10,8 +10,10 @@ from app.core.bootstrap import bootstrap_runtime_files
 from app.core.config import get_settings
 from app.core.exceptions import http_error_handler, unhandled_exception_handler
 from app.core.logging_config import setup_logging
+from app.integrations.gmail.oauth import migrate_legacy_token_file
 
 bootstrap_runtime_files()
+migrate_legacy_token_file()
 settings = get_settings()
 setup_logging()
 logger = logging.getLogger(__name__)
