@@ -1,4 +1,8 @@
+import os
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+_LOCAL_APP_BASE_URLS = {"http://127.0.0.1:8000", "http://localhost:8000"}
 
 
 class Settings(BaseSettings):
@@ -47,6 +51,33 @@ class Settings(BaseSettings):
     chat_session_ttl_seconds: int = 1800
     fraud_rules_examples_file: str = "reglas_fraude_ejemplos.md"
     allowed_origins: str = "http://localhost:3000"
+    cors_origin_regex: str = ""
+
+    @property
+    def resolved_app_base_url(self) -> str:
+        explicit = self.app_base_url.strip().rstrip("/")
+        if explicit and explicit not in _LOCAL_APP_BASE_URLS:
+            return explicit
+        railway_domain = os.getenv("RAILWAY_PUBLIC_DOMAIN", "").strip().rstrip("/")
+        if railway_domain:
+            return f"https://{railway_domain}"
+        return explicit or "http://127.0.0.1:8000"
+
+    @property
+    def resolved_gmail_oauth_redirect_uri(self) -> str:
+        explicit = self.gmail_oauth_redirect_uri.strip()
+        if explicit and "127.0.0.1" not in explicit and "localhost" not in explicit:
+            return explicit
+        return f"{self.resolved_app_base_url}{self.api_v1_str}/gmail/auth/callback"
+
+    @property
+    def cors_origin_regex_pattern(self) -> str | None:
+        explicit = self.cors_origin_regex.strip()
+        if explicit:
+            return explicit
+        if self.app_env == "production":
+            return r"https://.*\.vercel\.app"
+        return None
 
     @property
     def allowed_origins_list(self) -> list[str]:

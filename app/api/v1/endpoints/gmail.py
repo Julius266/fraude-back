@@ -71,7 +71,7 @@ def gmail_config() -> dict[str, str]:
         "gmail_watch_topic": settings.gmail_watch_topic,
         "gmail_client_secret_file": settings.gmail_client_secret_file,
         "gmail_token_file": settings.gmail_token_file,
-        "gmail_oauth_redirect_uri": settings.gmail_oauth_redirect_uri,
+        "gmail_oauth_redirect_uri": settings.resolved_gmail_oauth_redirect_uri,
     }
 
 

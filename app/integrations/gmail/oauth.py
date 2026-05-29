@@ -128,7 +128,7 @@ def _build_flow() -> Flow:
     return Flow.from_client_secrets_file(
         settings.gmail_client_secret_file,
         scopes=SCOPES,
-        redirect_uri=settings.gmail_oauth_redirect_uri,
+        redirect_uri=settings.resolved_gmail_oauth_redirect_uri,
     )
 
 
@@ -178,7 +178,7 @@ def get_auth_status() -> dict[str, Any]:
         "token_configured": token_file_exists(),
         "connected": False,
         "user": None,
-        "redirect_uri": settings.gmail_oauth_redirect_uri,
+        "redirect_uri": settings.resolved_gmail_oauth_redirect_uri,
     }
 
     creds = load_valid_credentials()

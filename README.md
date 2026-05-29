@@ -6,7 +6,9 @@ API backend en **FastAPI** para:
 - Persistencia de **siniestros** extraídos de PDFs.
 - **Scoring de fraude** por reglas y con **OpenAI** (opcional).
 
-Ejecución **local con Python** (sin Docker).
+Ejecución **local con Python** o **producción con Docker/Railway**.
+
+**Despliegue:** ver [DEPLOY.md](./DEPLOY.md)
 
 ---
 
@@ -30,6 +32,8 @@ Ejecución **local con Python** (sin Docker).
 cd ruta\a\fraude-back
 
 # 2. Entorno virtual (solo la primera vez; si .venv ya existe, omite python -m venv)
+#    Importante: la carpeta debe llamarse .venv (con punto), no venv.
+#    .\scripts\dev-up.ps1 y el resto del README asumen esa ruta.
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
@@ -167,8 +171,11 @@ cd ruta\a\fraude-back
 .\scripts\dev-up.ps1
 ```
 
+Este script usa `.\.venv\Scripts\python.exe` (no busca una carpeta `venv` sin punto).
+
 Este script:
 - libera puertos 8000, 8001 y 8002;
+- aplica `alembic upgrade head`;
 - arranca **solo un** backend en `http://127.0.0.1:8000`;
 - evita tener multiples uvicorn al mismo tiempo.
 
@@ -207,6 +214,78 @@ Sin activar venv:
 - Los logs se escriben en la **misma terminal** donde corre uvicorn (`INFO`, `ERROR`, tracebacks).
 - Las respuestas de error suelen ser JSON: `{ "detail": "..." }`.
 - Errores de Google API incluyen `"source": "google_api"`.
+
+---
+
+## Despliegue en Railway
+
+El repo incluye `Dockerfile` y `railway.toml`. Railway corre el contenedor, aplica migraciones al arrancar y expone la API en un dominio público (`*.up.railway.app`).
+
+### 1. Crear servicio
+
+1. [railway.app](https://railway.app) → **New Project** → **Deploy from GitHub** → repo `fraude-back`.
+2. Railway detecta el `Dockerfile` automáticamente.
+3. **Settings → Networking → Generate Domain** (obtienes algo como `https://fraude-back-production.up.railway.app`).
+
+### 2. Volumen persistente (Gmail token + adjuntos)
+
+Sin volumen, `token.json` y los PDFs se pierden en cada redeploy.
+
+1. **Add Volume** en el servicio.
+2. Monta en `/data`.
+3. Variables:
+
+```env
+GMAIL_TOKEN_FILE=/data/token.json
+GMAIL_DOWNLOAD_DIR=/data/gmail_attachments
+```
+
+### 3. Variables de entorno en Railway
+
+| Variable | Valor |
+|----------|--------|
+| `DATABASE_URL` | Tu Neon (con `?sslmode=require`) |
+| `FRONTEND_URL` | URL de Vercel, ej. `https://tu-app.vercel.app` |
+| `ALLOWED_ORIGINS` | Misma URL del front (varias separadas por coma) |
+| `GMAIL_WATCH_TOPIC` | `projects/fraudia/topics/...` |
+| `OPENAI_API_KEY` | Tu key |
+| `GOOGLE_OAUTH_CREDENTIALS_JSON` | Contenido completo de `credentials.json` (una línea) |
+| `APP_ENV` | `production` |
+
+`APP_BASE_URL` y el redirect OAuth se infieren de `RAILWAY_PUBLIC_DOMAIN` si no los defines. Comprueba con:
+
+```text
+GET https://TU-DOMINIO.up.railway.app/api/v1/gmail/config
+```
+
+### 4. Google Cloud (producción)
+
+En credenciales OAuth **Web**, agrega redirect autorizado:
+
+```text
+https://TU-DOMINIO.up.railway.app/api/v1/gmail/auth/callback
+```
+
+Pub/Sub push (si usas watch en tiempo real):
+
+```text
+https://TU-DOMINIO.up.railway.app/api/v1/webhooks/gmail/push
+```
+
+### 5. Frontend (Vercel)
+
+En el proyecto front:
+
+```env
+NEXT_PUBLIC_API_URL=https://TU-DOMINIO.up.railway.app
+```
+
+### Probar local con Docker (opcional)
+
+```powershell
+docker build -t fraude-back .
+docker run --rm -p 8000:8000 --env-file .env fraude-back
+```
 
 ---
 
@@ -324,6 +403,32 @@ fraude-back/
 ---
 
 ## Problemas frecuentes
+
+### `No se encontro .venv` al ejecutar `dev-up.ps1`
+
+Creaste el entorno como `venv` en lugar de `.venv`, o activaste `venv` pero el script espera `.venv`.
+
+**Si ya tienes `venv` con dependencias instaladas** (renombrar, no reinstalar):
+
+```powershell
+deactivate
+Rename-Item -Path venv -NewName .venv
+.\.venv\Scripts\Activate.ps1
+.\scripts\dev-up.ps1
+```
+
+**Si prefieres empezar de cero:**
+
+```powershell
+deactivate
+Remove-Item -Recurse -Force venv -ErrorAction SilentlyContinue
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+.\scripts\dev-up.ps1
+```
+
+No uses `python -m venv venv`; los scripts del repo solo reconocen `.venv`.
 
 ### `Permission denied` al crear `.venv`
 
