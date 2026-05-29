@@ -327,6 +327,11 @@ class GmailIngestionService:
                 len(siniestros_to_audit),
                 len(audits),
             )
+        else:
+            try:
+                self._send_auto_reply_template(correo)
+            except Exception:
+                logger.exception("Error al enviar auto-respuesta con la plantilla correo_id=%s", correo.id)
         return True, audits
 
     def _message_already_saved(self, message_id: str) -> bool:
@@ -406,10 +411,13 @@ class GmailIngestionService:
             return []
 
         filename = correo.adjunto_nombre or pdf_path.name
-        if not self._is_pdf_attachment({"filename": filename, "mime_type": "application/pdf"}):
+        is_pdf = filename.lower().endswith(".pdf")
+        is_txt = filename.lower().endswith(".txt")
+        if not is_pdf and not is_txt:
             return []
 
-        attachment = {"filename": filename, "mime_type": "application/pdf"}
+        mime_type = "application/pdf" if is_pdf else "text/plain"
+        attachment = {"filename": filename, "mime_type": mime_type}
         saved_attachment = (filename, str(pdf_path))
         to_audit = self._process_pdf_attachments(correo, [(attachment, saved_attachment)])
         return self._auto_audit_siniestros(to_audit)
@@ -449,9 +457,12 @@ class GmailIngestionService:
         entities_to_audit: list[Siniestro] = []
 
         for attachment, saved_attachment in saved_attachments:
-            if not self._is_pdf_attachment(attachment):
+            is_pdf = self._is_pdf_attachment(attachment)
+            is_txt = self._is_txt_attachment(attachment)
+
+            if not is_pdf and not is_txt:
                 logger.info(
-                    "Adjunto ignorado por no ser PDF correo_id=%s filename=%s mime_type=%s",
+                    "Adjunto ignorado por no ser PDF ni TXT correo_id=%s filename=%s mime_type=%s",
                     correo.id,
                     attachment.get("filename"),
                     attachment.get("mime_type"),
@@ -459,21 +470,31 @@ class GmailIngestionService:
                 continue
 
             _, attachment_path = saved_attachment
-            pdf_path = Path(attachment_path)
+            file_path = Path(attachment_path)
+            parsed_siniestros = []
+
             try:
-                parsed_siniestros = self.pdf_parser.parse(pdf_path)
+                if is_pdf:
+                    parsed_siniestros = self.pdf_parser.parse(file_path)
+                elif is_txt:
+                    text = file_path.read_text(encoding="utf-8", errors="ignore")
+                    blocks = self.pdf_parser._split_claim_blocks(text)
+                    parsed_siniestros = [
+                        self.pdf_parser._parse_block(block, file_path, index + 1)
+                        for index, block in enumerate(blocks)
+                    ]
             except Exception:
                 logger.exception(
-                    "Error parseando PDF para siniestros correo_id=%s pdf=%s",
+                    "Error parseando adjunto para siniestros correo_id=%s file=%s",
                     correo.id,
-                    pdf_path,
+                    file_path,
                 )
                 continue
 
             logger.info(
-                "PDF parseado correo_id=%s pdf=%s siniestros_detectados=%s",
+                "Adjunto parseado correo_id=%s file=%s siniestros_detectados=%s",
                 correo.id,
-                pdf_path,
+                file_path,
                 len(parsed_siniestros),
             )
 
@@ -626,6 +647,11 @@ class GmailIngestionService:
         mime_type = (attachment.get("mime_type") or "").lower()
         return filename.endswith(".pdf") or mime_type == "application/pdf"
 
+    def _is_txt_attachment(self, attachment: dict[str, str]) -> bool:
+        filename = (attachment.get("filename") or "").lower()
+        mime_type = (attachment.get("mime_type") or "").lower()
+        return filename.endswith(".txt") or mime_type.startswith("text/")
+
     def _build_siniestro_entity(
         self,
         correo_id: int,
@@ -693,3 +719,172 @@ class GmailIngestionService:
     def _is_history_not_found(self, error: HttpError) -> bool:
         resp = getattr(error, "resp", None)
         return getattr(resp, "status", None) == 404
+
+    def _extract_email_address(self, sender_str: str) -> str:
+        import re
+        match = re.search(r"<([^>]+)>", sender_str)
+        if match:
+            return match.group(1).strip().lower()
+        return sender_str.strip().lower()
+
+    def _send_auto_reply_template(self, correo: GmailCorreo) -> None:
+        from pathlib import Path
+        try:
+            connected = self.get_connected_user()
+            connected_email = connected.get("email", "").strip().lower()
+        except Exception:
+            connected_email = ""
+
+        sender_email = self._extract_email_address(correo.remitente)
+        if not sender_email or (connected_email and sender_email == connected_email):
+            logger.info("Auto-respuesta omitida: el remitente es el mismo analista conectado (%s)", sender_email)
+            return
+
+        normalized_subject = self.client.normalize_text(correo.asunto or "")
+        normalized_desc = self.client.normalize_text(correo.descripcion or "")
+        combined = f"{normalized_subject} {normalized_desc}"
+
+        keywords = ["SINIESTRO", "RECLAMO", "PLANTILLA", "FORMULARIO", "DECLARACION", "REPORTAR", "ACCIDENTE", "CHOQUE", "ROBO", "AYUDA"]
+        if not any(kw in combined for kw in keywords):
+            logger.info("Auto-respuesta omitida: el correo no contiene palabras de intención de reporte")
+            return
+
+        logger.info("Enviando auto-respuesta con plantilla de siniestro a remitente=%s thread_id=%s", correo.remitente, correo.thread_id)
+
+        template_text = (
+            "======================================================================\n"
+            "     ASEGURADORA DEL SUR - FORMULARIO DE DECLARACIÓN DE SINIESTRO\n"
+            "======================================================================\n\n"
+            "SINIESTRO: [Dejar en blanco para auto-generación]\n"
+            "NUMERO DE POLIZA: [Escribir el código de póliza, Ej: POL-VEH-2025-9981]\n"
+            "ASEGURADO TITULAR: [Escribir Nombre y Apellido del Asegurado]\n"
+            "RAMO DEL SEGURO: [Escribir Ramo: Vehículos, Salud, Hogar, Incendios o Vida]\n"
+            "COBERTURA: [Escribir tipo de Cobertura contratada, Ej: Cobertura Integral]\n"
+            "BENEFICIARIOS DESIGNADOS: [Escribir Nombre del Beneficiario que reclama]\n"
+            "SUCURSAL: [Escribir Sucursal: Guayaquil, Quito, Cuenca, Ambato o Manta]\n\n"
+            "----------------------------------------------------------------------\n"
+            "FECHAS DE CONTROL Y VIGENCIA\n"
+            "----------------------------------------------------------------------\n"
+            "FECHA INICIO POLIZA: [DD/MM/AAAA - Fecha de inicio de la cobertura]\n"
+            "FECHA FIN POLIZA: [DD/MM/AAAA - Fecha de vencimiento de la cobertura]\n\n"
+            "FECHA OCURRENCIA: EL DIA [Día en número] DE [Mes en letras, Ej: MAYO] DE [Año en número]\n"
+            "FECHA REPORTE: [DD/MM/AAAA - Fecha del reporte]\n\n"
+            "----------------------------------------------------------------------\n"
+            "ANÁLISIS FINANCIERO Y SINIESTRALIDAD\n"
+            "----------------------------------------------------------------------\n"
+            "MONTO RECLAMADO: $[Escribir valor numérico con decimales, Ej: 8.400,00]\n"
+            "MONTO ESTIMADO: $[Escribir valor estimado de daños, Ej: 8.000,00]\n"
+            "MONTO PAGADO: $0,00\n"
+            "SINIESTROS ANTERIORES: [Escribir número de reclamos previos, Ej: 0]\n\n"
+            "----------------------------------------------------------------------\n"
+            "NARRATIVA DE LOS HECHOS\n"
+            "----------------------------------------------------------------------\n"
+            "[Redacte de forma detallada y cronológica las circunstancias del siniestro,\n"
+            "los hechos ocurridos, los daños percibidos y la ubicación. Esta sección será\n"
+            "analizada lingüísticamente por la IA de ShieldMind.]\n\n"
+            "----------------------------------------------------------------------\n"
+            "CHECKLIST DE REQUISITOS Y DOCUMENTOS ENTREGADOS\n"
+            "----------------------------------------------------------------------\n"
+            "- Póliza Vigente: ENTREGADO\n"
+            "- Cédula de Identidad: ENTREGADO\n"
+            "- Denuncia Policial de Tránsito: ENTREGADO\n"
+            "- Fotos del Siniestro: ENTREGADO\n\n"
+            "======================================================================\n"
+        )
+
+        html_body = (
+            f"<div style='font-family: sans-serif; color: #081f3f; padding: 20px; background-color: #f4f6f9;'>"
+            f"  <div style='max-width: 650px; margin: 0 auto; background: #ffffff; border-radius: 8px; border: 1px solid #e2e8f0; overflow: hidden; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1);'>"
+            f"    <div style='background-color: #081f3f; padding: 20px; text-align: center; border-bottom: 4px solid #00adef;'>"
+            f"      <h2 style='color: #ffffff; margin: 0; font-size: 18px; font-weight: 800; text-transform: uppercase;'>Aseguradora del Sur</h2>"
+            f"      <p style='color: #00adef; margin: 4px 0 0 0; font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 1px;'>Asistente Virtual Antifraude • ShieldMind AI</p>"
+            f"    </div>"
+            f"    <div style='padding: 25px;'>"
+            f"      <p style='font-size: 13.5px; line-height: 1.5; color: #1e293b;'>Estimado cliente / beneficiario,</p>"
+            f"      <p style='font-size: 12.5px; line-height: 1.6; color: #475569;'>"
+            f"        Hemos recibido su consulta e intención de declarar o reportar un siniestro. Para brindarle un servicio prioritario de "
+            f"        auditoría y agilizar el procesamiento ético de su caso, requerimos que nos devuelva la información del siniestro estructurada."
+            f"      </p>"
+            f"      <p style='font-size: 12.5px; line-height: 1.6; color: #475569;'>"
+            f"        Por favor, <strong>responda a este correo electrónico</strong> o envíenos un documento PDF adjunto "
+            f"        <strong>completando exactamente la siguiente plantilla</strong> sin modificar los títulos de los campos:"
+            f"      </p>"
+            f"      <div style='background-color: #f8fafc; border: 1px solid #e2e8f0; padding: 15px; border-radius: 6px; margin: 20px 0; font-family: monospace; font-size: 11px; white-space: pre-wrap; color: #334155; max-height: 300px; overflow-y: auto;'>"
+            f"{template_text}"
+            f"      </div>"
+            f"      <div style='background-color: #f0fdf4; border-left: 4px solid #16a34a; padding: 12px; border-radius: 4px; margin: 20px 0;'>"
+            f"        <strong style='font-size: 11px; color: #15803d; text-transform: uppercase; display: block;'>Requisito Indispensable:</strong>"
+            f"        <p style='margin: 3px 0 0 0; font-size: 11px; color: #166534;'>"
+            f"          Recuerde adjuntar las evidencias físicas necesarias (Cédula de Identidad, Póliza vigente, Denuncia policial y Fotos del siniestro)."
+            f"        </p>"
+            f"      </div>"
+            f"      <p style='font-size: 11px; color: #64748b; text-align: center; border-top: 1px solid #e2e8f0; padding-top: 15px; margin-top: 25px;'>"
+            f"        Este es un correo automático generado por el motor de triaje virtual de Aseguradora del Sur.<br/>"
+            f"        No modifique los nombres de los campos de la plantilla para asegurar su procesamiento inmediato."
+            f"      </p>"
+            f"    </div>"
+            f"  </div>"
+            f"</div>"
+        )
+
+        subject = f"Re: {correo.asunto or 'Solicitud de Reporte de Siniestro'}"
+        
+        templates_dir = Path(self.settings.gmail_download_dir).parent / "templates"
+        templates_dir.mkdir(parents=True, exist_ok=True)
+
+        docx_path = templates_dir / "plantilla_siniestro.docx"
+        pdf_path = templates_dir / "plantilla_siniestro.pdf"
+
+        attachments = []
+        body_text_intro = ""
+
+        if docx_path.is_file():
+            logger.info("Plantilla de Word (.docx) encontrada para auto-respuesta: %s", docx_path)
+            attachments.append(
+                (
+                    "plantilla_siniestro.docx",
+                    docx_path.read_bytes(),
+                    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                )
+            )
+            body_text_intro = (
+                "Hemos recibido su solicitud de siniestro. Por favor, descargue la plantilla Word adjunta "
+                "('plantilla_siniestro.docx'), complete sus campos de información, guárdela y responda a este "
+                "correo electrónico adjuntando el archivo completado."
+            )
+        elif pdf_path.is_file():
+            logger.info("Plantilla PDF (.pdf) encontrada para auto-respuesta: %s", pdf_path)
+            attachments.append(
+                (
+                    "plantilla_siniestro.pdf",
+                    pdf_path.read_bytes(),
+                    "application/pdf",
+                )
+            )
+            body_text_intro = (
+                "Hemos recibido su solicitud de siniestro. Por favor, descargue la plantilla PDF adjunta "
+                "('plantilla_siniestro.pdf'), rellene los datos requeridos y responda a este correo electrónico "
+                "con el archivo completado adjunto."
+            )
+        else:
+            logger.warning("No se encontró plantilla Word (.docx) ni PDF (.pdf) en %s. Usando fallback de texto plano.", templates_dir)
+            attachments.append(
+                (
+                    "plantilla_siniestro.txt",
+                    template_text.encode("utf-8"),
+                    "text/plain",
+                )
+            )
+            body_text_intro = (
+                "Hemos recibido su solicitud de siniestro. Por favor, descargue la plantilla adjunta "
+                "'plantilla_siniestro.txt', rellene sus datos y responda a este correo adjuntándolo rellenado."
+            )
+
+        self.client.send_email(
+            to=correo.remitente,
+            subject=subject,
+            body_text=f"Estimado cliente,\n\n{body_text_intro}\n\n{template_text}",
+            html_body=html_body,
+            thread_id=correo.gmail_message_id,
+            attachments=attachments,
+        )

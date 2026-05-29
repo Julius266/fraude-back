@@ -8,12 +8,12 @@ from app.core.config import get_settings
 settings = get_settings()
 
 engine_kwargs = {"echo": settings.sqlalchemy_echo, "future": True}
-if settings.database_url.startswith("sqlite"):
+if settings.resolved_database_url.startswith("sqlite"):
     engine_kwargs["connect_args"] = {"check_same_thread": False}
-    engine = create_engine(settings.database_url, **engine_kwargs)
+    engine = create_engine(settings.resolved_database_url, **engine_kwargs)
 else:
     engine = create_engine(
-        settings.database_url,
+        settings.resolved_database_url,
         pool_pre_ping=True,
         pool_size=10,
         max_overflow=20,

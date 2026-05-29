@@ -17,7 +17,10 @@ from app.core.config import get_settings
 
 logger = logging.getLogger(__name__)
 
-SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
+SCOPES = [
+    "https://www.googleapis.com/auth/gmail.readonly",
+    "https://www.googleapis.com/auth/gmail.send",
+]
 
 _pending_flows: dict[str, tuple[Flow, str, datetime]] = {}
 

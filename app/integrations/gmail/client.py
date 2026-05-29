@@ -159,3 +159,64 @@ class GmailClient:
     def build_query(self, hours_back: int) -> str:
         since = datetime.now(timezone.utc) - timedelta(hours=hours_back)
         return f"after:{int(since.timestamp())} in:inbox"
+
+    def send_email(
+        self,
+        to: str,
+        subject: str,
+        body_text: str,
+        html_body: str | None = None,
+        thread_id: str | None = None,
+        attachments: list[tuple[str, bytes, str]] | None = None,
+    ) -> dict[str, Any]:
+        from email.mime.multipart import MIMEMultipart
+        from email.mime.text import MIMEText
+        from email.mime.base import MIMEBase
+        from email import encoders
+
+        if attachments:
+            message = MIMEMultipart("mixed")
+        else:
+            message = MIMEMultipart("alternative")
+
+        message["to"] = to
+        message["subject"] = subject
+        if thread_id:
+            message["In-Reply-To"] = thread_id
+            message["References"] = thread_id
+
+        if attachments:
+            body_container = MIMEMultipart("alternative")
+            message.attach(body_container)
+        else:
+            body_container = message
+
+        body_container.attach(MIMEText(body_text, "plain", "utf-8"))
+
+        if html_body:
+            body_container.attach(MIMEText(html_body, "html", "utf-8"))
+
+        if attachments:
+            for filename, data, mime_type in attachments:
+                maintype, subtype = mime_type.split("/", 1)
+                part = MIMEBase(maintype, subtype)
+                part.set_payload(data)
+                encoders.encode_base64(part)
+                part.add_header(
+                    "Content-Disposition",
+                    "attachment",
+                    filename=filename,
+                )
+                message.attach(part)
+
+        raw_message = base64.urlsafe_b64encode(message.as_bytes()).decode("utf-8")
+        body = {"raw": raw_message}
+        if thread_id:
+            body["threadId"] = thread_id
+
+        return (
+            self.service.users()
+            .messages()
+            .send(userId="me", body=body)
+            .execute()
+        )
