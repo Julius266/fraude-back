@@ -2,11 +2,20 @@ from pydantic import BaseModel, Field
 
 
 class ScoringSignals(BaseModel):
-    evidencia_falsificacion_documental: bool = False
-    coincidencia_lista_restrictiva: bool = False
-    dinamica_accidente_imposible: bool = False
-    demora_atipica_denuncia_robo: bool = False
-    narrativa_clonada: bool = False
+    # IA clasifica el tipo de cobertura/evento
+    cobertura_involucra_robo: bool = False        # robo, hurto, sustracción, apropiación
+
+    # IA evalúa proveedor / beneficiario
+    proveedor_en_lista_restrictiva: bool = False  # figura en lista negra/restrictiva
+    proveedor_recurrente_observado: bool = False  # aparece en >2 casos observados este año
+
+    # IA evalúa documentación
+    documentos_inconsistentes: bool = False       # fechas previas al evento, alteraciones, ilegibles
+
+    # IA evalúa dinámica del siniestro
+    dinamica_relato_ilogico: bool = False         # relato incompatible con tipo de impacto/daño
+    dinamica_accidente_madrugada: bool = False    # accidente múltiple entre 00:00 y 05:00
+    sin_tercero_identificado: bool = False        # daño severo sin rastro del tercero ni cámaras
 
 
 class SiniestroScoringRequest(BaseModel):
@@ -56,6 +65,14 @@ class ScoringAiExplanation(BaseModel):
     signal_rationale: dict[str, str] = Field(default_factory=dict)
 
 
+class ScoringContextData(BaseModel):
+    """Métricas de contexto BD persistidas junto al scoring para poder recalcular sin BD."""
+    max_narrative_similarity: float = 0.0
+    frecuencia_vehiculo: int = 0
+    frecuencia_rc_previo: int = 0
+
+
 class SiniestroAIScoringResponse(SiniestroScoringResponse):
     ai: ScoringAiExplanation | None = None
     signals: ScoringSignals | None = None
+    context_data: ScoringContextData | None = None

@@ -19,33 +19,70 @@ from app.schemas.scoring import ScoringAiExplanation, ScoringSignals
 logger = logging.getLogger(__name__)
 
 SYSTEM_PROMPT_BASE = """
-Eres un analista antifraude de seguros. Debes decidir UNICAMENTE estas senales booleanas:
-- evidencia_falsificacion_documental
-- coincidencia_lista_restrictiva
-- dinamica_accidente_imposible
-- demora_atipica_denuncia_robo
-- narrativa_clonada
+Eres un analista antifraude de seguros de vehículos. Analizas expedientes de siniestros y decides
+señales booleanas que luego alimentan un motor de scoring de fraude.
 
-Debes usar las herramientas cuando haga falta y explicar por que activas o no cada senal.
-Compara siempre el expediente actual con la biblioteca de casos de ejemplo incluida al final
-de estas instrucciones (reglas_fraude_ejemplos.md): esos casos son referencias adicionales
-de fraudes reales y sinteticos, no el siniestro en curso.
-Responde EXCLUSIVAMENTE JSON con esta estructura:
+Debes decidir ÚNICAMENTE las siguientes señales. Lee cada definición con cuidado:
+
+1. cobertura_involucra_robo
+   TRUE si la cobertura contratada o el tipo de siniestro implica robo, hurto, sustracción,
+   apropiación indebida o pérdida por cualquier acto de tercero con intención de apoderarse del
+   vehículo o sus partes — sin importar el nombre exacto de la cobertura en la póliza.
+   Ejemplos TRUE: "Pérdida Total por Robo", "Sustracción e Inutilización Total", "Hurto de
+   autopartes", "Robo parcial", "PTxRB", "Robo con violencia", "Apropiación indebida".
+
+2. proveedor_en_lista_restrictiva
+   TRUE si el beneficiario, taller, perito o proveedor del siniestro figura en listas restrictivas
+   o negras (compañía, CONDUSEF, OFAC, UNODC, etc.), según la evidencia disponible.
+
+3. proveedor_recurrente_observado
+   TRUE si el beneficiario o proveedor ha aparecido en más de 2 casos observados o con alertas
+   en los últimos 12 meses, según el historial consultado via herramientas.
+
+4. documentos_inconsistentes
+   TRUE si existen: alteraciones confirmadas, fechas de facturas previas al evento, firmas
+   ilegibles con datos contradictorios, o cualquier discrepancia material entre documentos
+   (denuncia, factura, fotos, informe pericial).
+
+5. dinamica_relato_ilogico
+   TRUE si el relato del siniestro es físicamente incompatible con los daños reportados.
+   Ejemplos: choque frontal pero daño solo lateral, volcadura sin marcas en techo,
+   impacto severo en zona sin marca de frenado, dirección de colisión inconsistente.
+
+6. dinamica_accidente_madrugada
+   TRUE si el accidente involucra múltiples vehículos Y ocurrió entre las 00:00 y las 05:00,
+   patrón asociado a simulaciones nocturnas.
+
+7. sin_tercero_identificado
+   TRUE si el vehículo asegurado muestra daño severo pero el tercero responsable se fugó sin
+   dejar placa, datos, ni existe registro de cámaras, testigos o policía en escena.
+
+IMPORTANTE:
+- Usa las herramientas disponibles para obtener historial, documentos y similitud narrativa
+  antes de decidir. No dejes de llamar herramientas cuando la información en el expediente sea
+  insuficiente para decidir una señal.
+- Para cobertura_involucra_robo: razona sobre el SIGNIFICADO de la cobertura, no sobre el texto
+  literal. Si el concepto es robo/sustracción aunque el nombre sea distinto, activa la señal.
+- Responde EXCLUSIVAMENTE en JSON con esta estructura exacta (sin bloques de código):
 {
   "signals": {
-    "evidencia_falsificacion_documental": false,
-    "coincidencia_lista_restrictiva": false,
-    "dinamica_accidente_imposible": false,
-    "demora_atipica_denuncia_robo": false,
-    "narrativa_clonada": false
+    "cobertura_involucra_robo": false,
+    "proveedor_en_lista_restrictiva": false,
+    "proveedor_recurrente_observado": false,
+    "documentos_inconsistentes": false,
+    "dinamica_relato_ilogico": false,
+    "dinamica_accidente_madrugada": false,
+    "sin_tercero_identificado": false
   },
-  "summary": "texto breve para analista",
+  "summary": "Resumen breve para el analista (2-3 oraciones).",
   "signal_rationale": {
-    "evidencia_falsificacion_documental": "...",
-    "coincidencia_lista_restrictiva": "...",
-    "dinamica_accidente_imposible": "...",
-    "demora_atipica_denuncia_robo": "...",
-    "narrativa_clonada": "..."
+    "cobertura_involucra_robo": "Justificación...",
+    "proveedor_en_lista_restrictiva": "Justificación...",
+    "proveedor_recurrente_observado": "Justificación...",
+    "documentos_inconsistentes": "Justificación...",
+    "dinamica_relato_ilogico": "Justificación...",
+    "dinamica_accidente_madrugada": "Justificación...",
+    "sin_tercero_identificado": "Justificación..."
   }
 }
 """.strip()
@@ -69,7 +106,7 @@ class AIScoringService:
 
     def analyze(self, siniestro: Siniestro) -> AIScoringResult:
         if not self.settings.openai_api_key:
-            raise ValueError("OPENAI_API_KEY no esta configurada")
+            raise ValueError("OPENAI_API_KEY no está configurada")
 
         base_context = {
             "siniestro": {
@@ -81,9 +118,14 @@ class AIScoringService:
                 "fecha_ocurrencia": str(siniestro.fecha_ocurrencia),
                 "fecha_reporte": str(siniestro.fecha_reporte),
                 "descripcion": siniestro.descripcion,
+                "documentos_completos": siniestro.documentos_completos,
+                "beneficiario": siniestro.beneficiario,
+                "monto_reclamado": float(siniestro.monto_reclamado or 0),
+                "monto_estimado": float(siniestro.monto_estimado or 0),
                 "dias_desde_inicio_poliza": siniestro.dias_desde_inicio_poliza,
                 "dias_desde_fin_poliza": siniestro.dias_desde_fin_poliza,
                 "dias_entre_ocurrencia_reporte": siniestro.dias_entre_ocurrencia_reporte,
+                "historial_siniestros_asegurado": siniestro.historial_siniestros_asegurado,
             }
         }
 
@@ -92,8 +134,8 @@ class AIScoringService:
             {
                 "role": "user",
                 "content": (
-                    "Analiza este siniestro (expediente actual). Puedes llamar herramientas para "
-                    "evidencias adicionales. Contrasta con los casos de ejemplo del system prompt.\n"
+                    "Analiza este expediente. Llama las herramientas que necesites para obtener "
+                    "evidencia adicional y luego decide las señales.\n"
                     + json.dumps(base_context, ensure_ascii=True)
                 ),
             },
@@ -102,7 +144,7 @@ class AIScoringService:
         tools = self._tool_specs()
         called_tools: list[str] = []
 
-        for _ in range(4):
+        for _ in range(5):
             response = self.client.chat.completions.create(
                 model=self.settings.openai_model,
                 messages=messages,
@@ -115,44 +157,37 @@ class AIScoringService:
             tool_calls = message.tool_calls or []
 
             if tool_calls:
-                messages.append(
-                    {
-                        "role": "assistant",
-                        "content": message.content or "",
-                        "tool_calls": [tool_call.model_dump() for tool_call in tool_calls],
-                    }
-                )
-                for tool_call in tool_calls:
-                    tool_name = tool_call.function.name
-                    called_tools.append(tool_name)
-                    raw_args = tool_call.function.arguments or "{}"
+                messages.append({
+                    "role": "assistant",
+                    "content": message.content or "",
+                    "tool_calls": [tc.model_dump() for tc in tool_calls],
+                })
+                for tc in tool_calls:
+                    called_tools.append(tc.function.name)
                     try:
-                        tool_args = json.loads(raw_args)
+                        args = json.loads(tc.function.arguments or "{}")
                     except json.JSONDecodeError:
-                        tool_args = {}
-                    tool_result = self._call_tool(tool_name, tool_args, siniestro)
-                    messages.append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": tool_call.id,
-                            "name": tool_name,
-                            "content": json.dumps(tool_result, ensure_ascii=True),
-                        }
-                    )
+                        args = {}
+                    result = self._call_tool(tc.function.name, args, siniestro)
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc.id,
+                        "name": tc.function.name,
+                        "content": json.dumps(result, ensure_ascii=True),
+                    })
                 continue
 
-            raw_content = message.content or "{}"
-            payload = self._parse_json(raw_content)
+            payload = self._parse_json(message.content or "{}")
             signals = ScoringSignals(**payload.get("signals", {}))
             explanation = ScoringAiExplanation(
                 model=self.settings.openai_model,
-                summary=payload.get("summary", "Analisis generado por IA."),
+                summary=payload.get("summary", "Análisis generado por IA."),
                 tools_called=called_tools,
                 signal_rationale=payload.get("signal_rationale", {}),
             )
             return AIScoringResult(signals=signals, explanation=explanation)
 
-        raise RuntimeError("La IA no devolvio una respuesta final valida")
+        raise RuntimeError("La IA no devolvió una respuesta final válida tras 5 iteraciones")
 
     def _parse_json(self, value: str) -> dict[str, Any]:
         content = value.strip()
@@ -168,21 +203,21 @@ class AIScoringService:
                 "type": "function",
                 "function": {
                     "name": "get_claim_history",
-                    "description": "Obtiene historial de siniestros del asegurado.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {"limit": {"type": "integer"}},
-                    },
+                    "description": "Obtiene historial de siniestros previos del mismo asegurado.",
+                    "parameters": {"type": "object", "properties": {"limit": {"type": "integer"}}},
                 },
             },
             {
                 "type": "function",
                 "function": {
-                    "name": "search_similar_claims",
-                    "description": "Busca siniestros similares por texto de descripcion.",
+                    "name": "detect_narrative_similarity",
+                    "description": (
+                        "Calcula la similitud textual de la descripción del siniestro actual contra "
+                        "siniestros recientes en la base de datos. Útil para detectar narrativas clonadas."
+                    ),
                     "parameters": {
                         "type": "object",
-                        "properties": {"limit": {"type": "integer"}},
+                        "properties": {"threshold": {"type": "number", "description": "Umbral mínimo de similitud, ej: 0.70"}},
                     },
                 },
             },
@@ -190,7 +225,7 @@ class AIScoringService:
                 "type": "function",
                 "function": {
                     "name": "get_client_profile",
-                    "description": "Perfil resumido del cliente/asegurado.",
+                    "description": "Perfil resumido del asegurado: total de siniestros, historial.",
                     "parameters": {"type": "object", "properties": {}},
                 },
             },
@@ -198,37 +233,15 @@ class AIScoringService:
                 "type": "function",
                 "function": {
                     "name": "retrieve_documents",
-                    "description": "Datos de documentos y correo asociado al siniestro.",
+                    "description": "Metadatos del correo y adjuntos asociados al siniestro.",
                     "parameters": {"type": "object", "properties": {}},
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "detect_narrative_similarity",
-                    "description": "Calcula similitud narrativa contra siniestros recientes.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {"threshold": {"type": "number"}},
-                    },
                 },
             },
             {
                 "type": "function",
                 "function": {
                     "name": "get_fraud_rule_examples",
-                    "description": (
-                        "Devuelve casos de referencia RF-01..RF-07 de reglas_fraude_ejemplos.md "
-                        "(fraudes confirmados y casos limpios) para calibrar las senales."
-                    ),
-                    "parameters": {"type": "object", "properties": {}},
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "explain_alerts",
-                    "description": "Devuelve contexto explicativo util para justificar alertas.",
+                    "description": "Casos de referencia de fraude confirmado y contraejemplos para calibrar señales.",
                     "parameters": {"type": "object", "properties": {}},
                 },
             },
@@ -236,28 +249,22 @@ class AIScoringService:
 
     def _call_tool(self, tool_name: str, args: dict[str, Any], siniestro: Siniestro) -> dict[str, Any]:
         if tool_name == "get_claim_history":
-            limit = int(args.get("limit", 10))
-            return self._get_claim_history(siniestro, limit)
-        if tool_name == "search_similar_claims":
-            limit = int(args.get("limit", 10))
-            return self._search_similar_claims(siniestro, limit)
+            return self._get_claim_history(siniestro, int(args.get("limit", 10)))
+        if tool_name == "detect_narrative_similarity":
+            return self._detect_narrative_similarity(siniestro, float(args.get("threshold", 0.70)))
         if tool_name == "get_client_profile":
             return self._get_client_profile(siniestro)
         if tool_name == "retrieve_documents":
             return self._retrieve_documents(siniestro)
-        if tool_name == "detect_narrative_similarity":
-            threshold = float(args.get("threshold", 0.85))
-            return self._detect_narrative_similarity(siniestro, threshold)
         if tool_name == "get_fraud_rule_examples":
             return self._get_fraud_rule_examples()
-        if tool_name == "explain_alerts":
-            return self._explain_alerts(siniestro)
-        return {"error": f"tool no soportada: {tool_name}"}
+        return {"error": f"Herramienta desconocida: {tool_name}"}
 
     def _get_claim_history(self, siniestro: Siniestro, limit: int) -> dict[str, Any]:
         rows = self.db.scalars(
             select(Siniestro)
-            .where(Siniestro.id_asegurado == siniestro.id_asegurado, Siniestro.id_siniestro != siniestro.id_siniestro)
+            .where(Siniestro.id_asegurado == siniestro.id_asegurado,
+                   Siniestro.id_siniestro != siniestro.id_siniestro)
             .order_by(Siniestro.fecha_reporte.desc())
             .limit(max(limit, 1))
         ).all()
@@ -265,110 +272,64 @@ class AIScoringService:
             "count": len(rows),
             "claims": [
                 {
-                    "id_siniestro": row.id_siniestro,
-                    "fecha_reporte": str(row.fecha_reporte),
-                    "ramo": row.ramo,
-                    "estado": row.estado,
-                    "historial_siniestros_asegurado": row.historial_siniestros_asegurado,
+                    "id_siniestro": r.id_siniestro,
+                    "fecha_reporte": str(r.fecha_reporte),
+                    "ramo": r.ramo,
+                    "cobertura": r.cobertura,
+                    "estado": r.estado,
+                    "historial_siniestros_asegurado": r.historial_siniestros_asegurado,
                 }
-                for row in rows
+                for r in rows
             ],
         }
 
-    def _search_similar_claims(self, siniestro: Siniestro, limit: int) -> dict[str, Any]:
-        rows = self.db.scalars(
-            select(Siniestro)
-            .where(Siniestro.id_siniestro != siniestro.id_siniestro)
-            .order_by(Siniestro.fecha_reporte.desc())
-            .limit(max(limit, 1))
-        ).all()
-        ranked = []
-        for row in rows:
-            similarity = SequenceMatcher(a=siniestro.descripcion.lower(), b=row.descripcion.lower()).ratio()
-            ranked.append(
-                {
-                    "id_siniestro": row.id_siniestro,
-                    "similarity": round(similarity, 4),
-                    "descripcion": row.descripcion[:240],
-                }
-            )
-        ranked.sort(key=lambda item: item["similarity"], reverse=True)
-        return {"matches": ranked[:limit]}
-
     def _get_client_profile(self, siniestro: Siniestro) -> dict[str, Any]:
         total = self.db.scalar(
-            select(func.count())
-            .select_from(Siniestro)
+            select(func.count()).select_from(Siniestro)
             .where(Siniestro.id_asegurado == siniestro.id_asegurado)
         )
         return {
             "id_asegurado": siniestro.id_asegurado,
             "historial_siniestros_asegurado": siniestro.historial_siniestros_asegurado,
-            "claims_in_db": int(total or 0),
+            "total_siniestros_en_db": int(total or 0),
         }
 
     def _retrieve_documents(self, siniestro: Siniestro) -> dict[str, Any]:
         if not siniestro.gmail_correo_id:
             return {"has_email": False, "documents": []}
-
         correo = self.db.get(GmailCorreo, siniestro.gmail_correo_id)
         if not correo:
             return {"has_email": False, "documents": []}
-
-        documents = []
+        docs = []
         if correo.adjunto_nombre or correo.adjunto_ruta:
-            documents.append(
-                {
-                    "name": correo.adjunto_nombre,
-                    "path": correo.adjunto_ruta,
-                    "source": "gmail",
-                }
-            )
-
-        return {
-            "has_email": True,
-            "subject": correo.asunto,
-            "from": correo.remitente,
-            "documents": documents,
-        }
+            docs.append({"name": correo.adjunto_nombre, "path": correo.adjunto_ruta, "source": "gmail"})
+        return {"has_email": True, "subject": correo.asunto, "from": correo.remitente, "documents": docs}
 
     def _detect_narrative_similarity(self, siniestro: Siniestro, threshold: float) -> dict[str, Any]:
         rows = self.db.scalars(
             select(Siniestro)
             .where(Siniestro.id_siniestro != siniestro.id_siniestro)
             .order_by(Siniestro.fecha_reporte.desc())
-            .limit(30)
+            .limit(50)
         ).all()
-
         hits = []
         for row in rows:
             ratio = SequenceMatcher(a=siniestro.descripcion.lower(), b=row.descripcion.lower()).ratio()
             if ratio >= threshold:
-                hits.append({"id_siniestro": row.id_siniestro, "similarity": round(ratio, 4)})
-
+                hits.append({"id_siniestro": row.id_siniestro, "similarity": round(ratio, 4),
+                              "descripcion_preview": row.descripcion[:200]})
+        hits.sort(key=lambda x: x["similarity"], reverse=True)
         return {
             "threshold": threshold,
-            "hits": hits,
-            "max_similarity": max((item["similarity"] for item in hits), default=0.0),
+            "hits": hits[:10],
+            "max_similarity": hits[0]["similarity"] if hits else 0.0,
         }
 
     def _get_fraud_rule_examples(self) -> dict[str, Any]:
         from app.integrations.siniestros.fraud_rules_context import load_fraud_rules_examples
-
         content = load_fraud_rules_examples()
         return {
             "source": "reglas_fraude_ejemplos.md",
-            "purpose": "Casos adicionales de fraude y contraejemplos para calibrar RF-01..RF-07",
             "content": content,
             "available": bool(content.strip()),
-        }
-
-    def _explain_alerts(self, siniestro: Siniestro) -> dict[str, Any]:
-        return {
-            "dias_entre_ocurrencia_reporte": siniestro.dias_entre_ocurrencia_reporte,
-            "dias_desde_inicio_poliza": siniestro.dias_desde_inicio_poliza,
-            "dias_desde_fin_poliza": siniestro.dias_desde_fin_poliza,
-            "ramo": siniestro.ramo,
-            "cobertura": siniestro.cobertura,
-            "fraud_examples_doc": "reglas_fraude_ejemplos.md",
         }

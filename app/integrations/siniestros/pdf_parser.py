@@ -43,6 +43,8 @@ class ParsedSiniestroDraft:
     dias_entre_ocurrencia_reporte: int
     historial_siniestros_asegurado: int
     etiqueta_fraude_simulada: bool
+    # Similitud narrativa pre-calculada en el PDF (0.0 si no aparece explícitamente)
+    max_narrative_similarity_from_pdf: float = 0.0
 
 
 class SiniestroPdfParser:
@@ -157,21 +159,29 @@ class SiniestroPdfParser:
         documentos_completos = self._parse_documents_complete(text)
         historial_siniestros = self._parse_historial_siniestros(text)
         dias_entre = max((report_date - occurrence_date).days, 0)
-        dias_inicio = self._parse_days_from_policy_dates(text, report_date, occurrence_date, ["FECHA INICIO POLIZA", "INICIO POLIZA", "FECHA DE INICIO"])
-        dias_fin = self._parse_days_from_policy_dates(text, report_date, occurrence_date, ["FECHA FIN POLIZA", "FIN POLIZA", "FECHA DE FIN"])
+
+        # Primero intentamos leer el valor pre-calculado del PDF ("Días desde inicio póliza: 29").
+        # Si no existe, calculamos desde la fecha de inicio/fin de póliza.
+        dias_inicio = (
+            self._parse_days_field(text, ["DIAS DESDE INICIO POLIZA", "DIAS INICIO POLIZA", "DESDE INICIO POLIZA"])
+            or self._parse_days_from_policy_dates(text, report_date, occurrence_date, ["FECHA INICIO POLIZA", "INICIO POLIZA", "FECHA DE INICIO"])
+        )
+        dias_fin = (
+            self._parse_days_field(text, ["DIAS DESDE FIN POLIZA", "DIAS FIN POLIZA", "DESDE FIN POLIZA"])
+            or self._parse_days_from_policy_dates(text, report_date, occurrence_date, ["FECHA FIN POLIZA", "FIN POLIZA", "FECHA DE FIN"])
+        )
 
         etiqueta_fraude = score >= 70 or self._contains_any(text, ["RIESGO CRITICO DE FRAUDE", "RIESGO CRÍTICO DE FRAUDE"])
         estado = "Pendiente de revision"
         sucursal = self._extract_value(lines, ["SUCURSAL", "OFICINA", "AGENCIA"]) or "No especificada"
+        similarity_from_pdf = self._parse_max_narrative_similarity(text)
 
         logger.info(
-            "Bloque parseado pdf=%s sequence=%s siniestro=%s poliza=%s score=%s docs_ok=%s",
-            pdf_path,
-            sequence,
-            siniestro_id,
-            policy_id,
-            score,
-            documentos_completos,
+            "Bloque parseado pdf=%s seq=%s siniestro=%s poliza=%s "
+            "historial=%s dias_inicio=%s dias_fin=%s dias_entre=%s docs_ok=%s score=%s",
+            pdf_path, sequence, siniestro_id, policy_id,
+            historial_siniestros, dias_inicio, dias_fin, dias_entre,
+            documentos_completos, score,
         )
 
         return ParsedSiniestroDraft(
@@ -195,6 +205,7 @@ class SiniestroPdfParser:
             dias_entre_ocurrencia_reporte=dias_entre,
             historial_siniestros_asegurado=historial_siniestros,
             etiqueta_fraude_simulada=etiqueta_fraude,
+            max_narrative_similarity_from_pdf=similarity_from_pdf,
         )
 
     def _extract_value(self, lines: list[str], labels: list[str], same_line_prefixes: list[str] | None = None) -> str | None:
@@ -304,20 +315,65 @@ class SiniestroPdfParser:
             return int(match.group(1))
         return 0
 
+    def _parse_max_narrative_similarity(self, text: str) -> float:
+        """
+        Lee la similitud narrativa pre-calculada del PDF cuando aparece explícitamente,
+        ej: '78% de similitud textual con el siniestro SIN-2022-309'.
+        Devuelve 0.0 si no se encuentra (el motor la calculará contra la BD).
+        """
+        normalized = self._normalize(text)
+        match = re.search(r"(\d{1,3})\s*%\s*DE\s+SIMILITUD\s+TEXTUAL", normalized)
+        if match:
+            pct = int(match.group(1))
+            return min(pct / 100.0, 1.0)
+        return 0.0
+
+    # Keywords que solo indican doc incompleto cuando aparecen junto a contexto documental
+    _DOC_CONTEXT_WORDS = {"DOCUMENTO", "REQUISITO", "CHECKLIST", "ADJUNTO", "CERTIFICADO", "FACTURA", "DENUNCIA", "INFORME"}
+    _DOC_INCOMPLETE_WORDS = {"FALTANTE", "ILEGIBLE", "NO ENTREGADO", "PENDIENTE", "INCOMPLETO", "FALTA"}
+    _DOC_COMPLETE_WORDS = {"ENTREGADO", "COMPLETO", "DOCUMENTACION COMPLETA", "REQUISITOS COMPLETOS"}
+
     def _parse_documents_complete(self, text: str) -> bool:
         normalized = self._normalize(text)
-        if any(keyword in normalized for keyword in ["FALTANTE", "ILEGIBLE", "NO ENTREGADO", "PENDIENTE"]):
-            return False
-        if "ENTREGADO" in normalized:
-            return True
-        return False
+        lines = [line.strip() for line in normalized.splitlines() if line.strip()]
+
+        for line in lines:
+            has_doc_context = any(ctx in line for ctx in self._DOC_CONTEXT_WORDS)
+            if not has_doc_context:
+                continue
+            if any(kw in line for kw in self._DOC_INCOMPLETE_WORDS):
+                return False
+            if any(kw in line for kw in self._DOC_COMPLETE_WORDS):
+                return True
+
+        # Sin sección documental explícita: se asume completo
+        return True
+
+    def _parse_days_field(self, text: str, labels: list[str]) -> int:
+        """Lee un número de días pre-calculado del PDF, ej: 'Días desde inicio póliza: 29'."""
+        compact_text = self._compact(self._normalize(text))
+        for label in labels:
+            compact_label = self._compact(label)
+            match = re.search(rf"{re.escape(compact_label)}:?(\d+)", compact_text)
+            if match:
+                return int(match.group(1))
+        return 0
 
     def _parse_historial_siniestros(self, text: str) -> int:
         normalized = self._normalize(text)
-        match = re.search(r"(\d+)\s+SINIESTROS?\s+REPORTADOS\s+EN\s+LOS\s+ULTIMOS\s+12\s+MESES", normalized)
+        # "Historial: 2 siniestros en 11 meses" / "3 siniestros en 18 meses"
+        match = re.search(r"HISTORIAL\s*:\s*(\d+)\s+SINIESTROS?", normalized)
         if match:
             return int(match.group(1))
-        match = re.search(r"SINIESTROS?\s+ANTERIORES\s*(\d+)", normalized)
+        match = re.search(r"(\d+)\s+SINIESTROS?\s+EN\s+\d+\s+MESES", normalized)
+        if match:
+            return int(match.group(1))
+        # "X SINIESTROS REPORTADOS EN LOS ULTIMOS N MESES"
+        match = re.search(r"(\d+)\s+SINIESTROS?\s+REPORTADOS\s+EN\s+LOS\s+ULTIMOS\s+\d+\s+MESES", normalized)
+        if match:
+            return int(match.group(1))
+        # "SINIESTROS ANTERIORES: X"
+        match = re.search(r"SINIESTROS?\s+ANTERIORES\s*:?\s*(\d+)", normalized)
         if match:
             return int(match.group(1))
         return 0

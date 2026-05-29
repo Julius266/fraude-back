@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from app.integrations.chat.vector_search import SearchHit
-from app.integrations.siniestros.scoring import FraudScoringService, ScoreComputation
+from app.integrations.siniestros.scoring import FraudScoringService, ScoreComputation, ScoringContext
 from app.schemas.scoring import ScoringRuleResult, ScoringSignals
 
 
@@ -17,8 +17,21 @@ def _signals_from_payload(payload: dict | None) -> ScoringSignals:
         return ScoringSignals()
 
 
+def _context_from_payload(payload: dict | None) -> ScoringContext:
+    """Restaura el ScoringContext guardado en el scoring_payload del AI audit."""
+    if not isinstance(payload, dict):
+        return ScoringContext()
+    ctx = payload.get("context_data") or {}
+    if not isinstance(ctx, dict):
+        return ScoringContext()
+    return ScoringContext(
+        max_narrative_similarity=float(ctx.get("max_narrative_similarity", 0.0)),
+        frecuencia_vehiculo=int(ctx.get("frecuencia_vehiculo", 0)),
+        frecuencia_rc_previo=int(ctx.get("frecuencia_rc_previo", 0)),
+    )
+
+
 def reconcile_total_score(payload: dict) -> int:
-    """Suma puntos de reglas activadas; fallback al total persistido."""
     rules = payload.get("rules") or []
     if isinstance(rules, list) and rules:
         matched_total = sum(
@@ -39,8 +52,8 @@ def official_score_for_siniestro(
     scoring_service: FraudScoringService | None = None,
 ) -> ScoreComputation:
     """
-    Fuente de verdad alineada con AutoScoringService y la Clarity Card.
-    Si hay signals persistidos, recalcula con ellos (incluye RF-06, RF-07, etc.).
+    Fuente de verdad del scoring. Restaura signals y context_data del payload
+    persistido por el AI audit para que RS-04, RS-06 y RS-13 se muestren correctos.
     """
     service = scoring_service or FraudScoringService()
     payload = getattr(siniestro, "scoring_payload", None)
@@ -49,7 +62,8 @@ def official_score_for_siniestro(
         return service.calculate(siniestro, ScoringSignals())
 
     signals = _signals_from_payload(payload)
-    result = service.calculate(siniestro, signals)
+    context = _context_from_payload(payload)
+    result = service.calculate(siniestro, signals, context)
 
     if payload.get("signals"):
         return result
